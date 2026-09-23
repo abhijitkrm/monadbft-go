@@ -56,9 +56,22 @@ func reverse(b []byte) []byte {
 	return out
 }
 
-// GetLeader — Rust WeightedRoundRobin::get_leader.
-// validators must be in sorted (map) order; zero-stake entries are skipped.
-func (WeightedRoundRobin) GetLeader(round types.Round, members []types.NodeId, stakeOf func(types.NodeId) types.Stake) types.NodeId {
+// LeaderElection — Rust leader_election::LeaderElection trait.
+type LeaderElection interface {
+	GetLeader(round types.Round, valSet *ValidatorSet) types.NodeId
+}
+
+// GetLeader — Rust WeightedRoundRobin::get_leader(round, validators).
+func (w WeightedRoundRobin) GetLeader(round types.Round, valSet *ValidatorSet) types.NodeId {
+	return w.getLeader(round, valSet.Members(), func(id types.NodeId) types.Stake {
+		s, _ := valSet.StakeOf(id)
+		return s
+	})
+}
+
+// getLeader — the raw algorithm; members must be in sorted (map) order and
+// zero-stake entries are skipped.
+func (WeightedRoundRobin) getLeader(round types.Round, members []types.NodeId, stakeOf func(types.NodeId) types.Stake) types.NodeId {
 	var bounds []struct {
 		id    types.NodeId
 		bound *big.Int // cumulative stake upper bound (exclusive index space)

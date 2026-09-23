@@ -10,7 +10,8 @@ import (
 const protocolMessageName = "ProtocolMessage"
 
 // ProtocolMessage — Rust enum, encodes as ["ProtocolMessage", tag, inner]:
-//   1 Proposal, 2 Vote, 3 Timeout, 4 RoundRecovery, 5 NoEndorsement, 6 AdvanceRound.
+//
+//	1 Proposal, 2 Vote, 3 Timeout, 4 RoundRecovery, 5 NoEndorsement, 6 AdvanceRound.
 type ProtocolMessage struct {
 	Kind          ProtocolMessageKind
 	Proposal      *ProposalMessage
@@ -152,8 +153,8 @@ func (m ConsensusMessage) GetRound() types.Round { return m.Message.GetRound() }
 // On the wire this is what gets deserialized first; the secp sig recovers
 // the author NodeId over domain ConsensusMessage || rlp(obj).
 type Unverified struct {
-	Obj              ConsensusMessage
-	AuthorSignature  crypto.SecpSignature
+	Obj             ConsensusMessage
+	AuthorSignature crypto.SecpSignature
 }
 
 func (u Unverified) EncodeRLP(dst []byte) []byte {

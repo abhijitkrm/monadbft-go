@@ -30,7 +30,7 @@ type FinalizedHeader interface {
 // Protocol supplies fresh zero values for decoding — the Go equivalent of
 // Rust's EPT type parameter.
 type Protocol struct {
-	NewProposedHeader   func() ProposedHeader
-	NewBody             func() Body
-	NewFinalizedHeader  func() FinalizedHeader
+	NewProposedHeader  func() ProposedHeader
+	NewBody            func() Body
+	NewFinalizedHeader func() FinalizedHeader
 }

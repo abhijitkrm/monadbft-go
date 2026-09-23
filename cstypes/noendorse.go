@@ -69,9 +69,9 @@ func (n *NoEndorsementCertificate) DecodeRLP(s *rlp.Stream) error {
 
 // FreshProposalCertificate — Rust enum: Nec(tag 1) | NoTip(tag 2).
 type FreshProposalCertificate struct {
-	IsNec  bool
-	Nec    *NoEndorsementCertificate
-	NoTip  *NoTipCertificate
+	IsNec bool
+	Nec   *NoEndorsementCertificate
+	NoTip *NoTipCertificate
 }
 
 func FPCFromNec(nec NoEndorsementCertificate) *FreshProposalCertificate {

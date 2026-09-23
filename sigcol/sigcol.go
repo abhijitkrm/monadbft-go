@@ -26,6 +26,25 @@ var (
 	ErrSignersLenExceeded    = errors.New("sigcol: signers count exceeds limit")
 )
 
+// InvalidSignaturesCreateError carries the (node_id, sig) pairs whose
+// individual verification failed — Rust SignatureCollectionError::
+// InvalidSignaturesCreate. Callers drop these voters and retry.
+type InvalidSignaturesCreateError struct {
+	Bad []NodeSig
+}
+
+func (e *InvalidSignaturesCreateError) Error() string {
+	return fmt.Sprintf("sigcol: %d invalid signatures on create", len(e.Bad))
+}
+
+func (e *InvalidSignaturesCreateError) NodeIds() []types.NodeId {
+	out := make([]types.NodeId, len(e.Bad))
+	for i, s := range e.Bad {
+		out[i] = s.NodeId
+	}
+	return out
+}
+
 // SignerMap is a BitVec<u8, Lsb0> over validator indices.
 // Bit i refers to the i-th validator in ValidatorMapping's sorted order.
 type SignerMap struct {
@@ -199,11 +218,24 @@ func New(
 	}
 	var compressed []byte
 	if any {
-		compressed = agg.ToSignature().Compress()
-		// verify aggregate
-		if !agg.ToSignature().FastAggregateVerifyPreAggregated(domain, msg, aggPk) {
-			return nil, ErrInvalidSignatures
+		aggSig := agg.ToSignature()
+		// verify aggregate; on failure localize invalid signers
+		// (Rust uses the aggregation tree to bisect — we verify each signer)
+		if !aggSig.FastAggregateVerifyPreAggregated(domain, msg, aggPk) {
+			var bad []NodeSig
+			for nodeId, sig := range seen {
+				if !sig.Verify(domain, msg, mapping.PubKey(nodeId)) {
+					bad = append(bad, NodeSig{NodeId: nodeId, Sig: sig})
+				}
+			}
+			if len(bad) == 0 {
+				// aggregate failure without individually-invalid sigs
+				// (e.g. sum-to-infinity attack) — treat all as suspect
+				return nil, ErrInvalidSignatures
+			}
+			return nil, &InvalidSignaturesCreateError{Bad: bad}
 		}
+		compressed = aggSig.Compress()
 	} else {
 		compressed = crypto.BlsSignatureInfinity().Compress()
 	}

@@ -35,7 +35,7 @@ type ConsensusBlockHeader struct {
 	QC                      QuorumCertificate
 	Author                  types.NodeId
 	SeqNum                  types.SeqNum
-	TimestampNs             [16]byte // u128 big-endian
+	TimestampNs             types.U128
 	RoundSignature          RoundSignature
 	DelayedExecutionResults []exec.FinalizedHeader // LimitedVec<_,4>
 	ExecutionInputs         exec.ProposedHeader
@@ -45,16 +45,6 @@ type ConsensusBlockHeader struct {
 	BaseFeeMoment           uint64
 }
 
-func u128Bytes(v [16]byte) (hi, lo uint64) {
-	for i := 0; i < 8; i++ {
-		hi = hi<<8 | uint64(v[i])
-	}
-	for i := 8; i < 16; i++ {
-		lo = lo<<8 | uint64(v[i])
-	}
-	return
-}
-
 func (h ConsensusBlockHeader) EncodeRLP(dst []byte) []byte {
 	return rlp.AppendList(dst, func(p []byte) []byte {
 		p = h.BlockRound.EncodeRLP(p)
@@ -62,8 +52,7 @@ func (h ConsensusBlockHeader) EncodeRLP(dst []byte) []byte {
 		p = h.QC.EncodeRLP(p)
 		p = h.Author.EncodeRLP(p)
 		p = h.SeqNum.EncodeRLP(p)
-		hi, lo := u128Bytes(h.TimestampNs)
-		p = rlp.AppendUint128(p, hi, lo)
+		p = h.TimestampNs.EncodeRLP(p)
 		p = rlp.AppendString(p, h.RoundSignature.Compress())
 		p = rlp.AppendList(p, func(q []byte) []byte {
 			for _, fh := range h.DelayedExecutionResults {
@@ -101,15 +90,8 @@ func (h *ConsensusBlockHeader) DecodeRLP(s *rlp.Stream, ep *exec.Protocol) error
 	if err := h.SeqNum.DecodeRLP(l); err != nil {
 		return err
 	}
-	hi, lo, err := l.Uint128()
-	if err != nil {
+	if err := h.TimestampNs.DecodeRLP(l); err != nil {
 		return err
-	}
-	for i := 0; i < 8; i++ {
-		h.TimestampNs[i] = byte(hi >> (56 - 8*i))
-	}
-	for i := 0; i < 8; i++ {
-		h.TimestampNs[8+i] = byte(lo >> (56 - 8*i))
 	}
 	sigB, err := l.FixedBytes(crypto.BlsSignatureCompressdLen)
 	if err != nil {
@@ -225,6 +207,12 @@ func (b ConsensusFullBlock) EncodeRLP(dst []byte) []byte {
 		return p
 	})
 }
+
+func (b ConsensusFullBlock) GetId() types.BlockId       { return b.Header.GetId() }
+func (b ConsensusFullBlock) GetParentId() types.BlockId { return b.Header.GetParentId() }
+func (b ConsensusFullBlock) GetSeqNum() types.SeqNum    { return b.Header.SeqNum }
+func (b ConsensusFullBlock) GetBlockRound() types.Round { return b.Header.BlockRound }
+func (b ConsensusFullBlock) GetEpoch() types.Epoch      { return b.Header.Epoch }
 
 // BlockRange — Rust BlockRange { last_block_id, num_blocks }.
 type BlockRange struct {

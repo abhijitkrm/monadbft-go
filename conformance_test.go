@@ -251,10 +251,7 @@ func TestLeaderElection(t *testing.T) {
 	}
 	election := validator.WeightedRoundRobin{}
 	for r := uint64(0); r < 8; r++ {
-		got := election.GetLeader(types.Round(r), vs.Members(), func(id types.NodeId) types.Stake {
-			s, _ := vs.StakeOf(id)
-			return s
-		})
+		got := election.GetLeader(types.Round(r), vs)
 		// fixture line: "leader_round_r: <pubkey> (pos N)"
 		line := v["leader_round_"+itoa(int(r))+"_pk"]
 		want := v["leader_round_"+itoa(int(r))]

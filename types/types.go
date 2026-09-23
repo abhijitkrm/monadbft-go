@@ -203,3 +203,42 @@ func (n NodeId) String() string { return n.PubKey.String() }
 type LimitedVec[T rlp.Encodable] struct {
 	Items []T
 }
+
+// RouterTarget — Rust monad_types::RouterTarget. Tells the router how to
+// disseminate a consensus message.
+type RouterTargetKind uint8
+
+const (
+	RouterBroadcast RouterTargetKind = iota + 1
+	RouterRaptorcast
+	RouterPointToPoint
+	RouterDirectPointToPoint
+	RouterTcpPointToPoint
+)
+
+type RouterTarget struct {
+	Kind  RouterTargetKind
+	Epoch Epoch  // Broadcast, Raptorcast
+	Round Round  // Raptorcast only
+	To    NodeId // PointToPoint, DirectPointToPoint, TcpPointToPoint
+}
+
+func BroadcastTarget(epoch Epoch) RouterTarget {
+	return RouterTarget{Kind: RouterBroadcast, Epoch: epoch}
+}
+func RaptorcastTarget(round Round, epoch Epoch) RouterTarget {
+	return RouterTarget{Kind: RouterRaptorcast, Round: round, Epoch: epoch}
+}
+func PointToPointTarget(to NodeId) RouterTarget {
+	return RouterTarget{Kind: RouterPointToPoint, To: to}
+}
+
+// FullnodeBroadcastMode — Rust monad_types::FullnodeBroadcastMode.
+type FullnodeBroadcastMode uint8
+
+const (
+	// SecondaryRaptorcast — two-hop raptorcast into the full-node group.
+	SecondaryRaptorcast FullnodeBroadcastMode = iota
+	// FullnodeBroadcast — direct broadcast to all full nodes.
+	FullnodeBroadcast
+)
