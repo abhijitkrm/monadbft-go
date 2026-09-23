@@ -198,6 +198,9 @@ type SwarmConfig struct {
 	Timestamper       TimestamperConfig
 	FinalizationDelay types.SeqNum
 	Seeds             func(i int) [32]byte
+	// PersistDirs — when non-nil, node i persists WAL+blockstore+forkpoint
+	// under PersistDirs[i] (A3).
+	PersistDirs []string
 }
 
 // NewBytesSwarm — builds a SwarmBuilder of nodes using BytesRouterScheduler.
@@ -215,6 +218,10 @@ func NewBytesSwarm(cfg SwarmConfig) SwarmBuilder {
 			seed = DefaultSeed(i)
 		}
 		nodeID := types.NewNodeId(sb.Keypair.PubKey())
+		var persist *PersistSpec
+		if cfg.PersistDirs != nil {
+			persist = &PersistSpec{Dir: cfg.PersistDirs[i]}
+		}
 		out[i] = NodeBuilder{
 			ID:                NewID(nodeID),
 			StateBuilder:      &sb,
@@ -227,6 +234,7 @@ func NewBytesSwarm(cfg SwarmConfig) SwarmBuilder {
 			InboundPipeline:   cfg.InPipeline(),
 			TimestamperConfig: cfg.Timestamper,
 			Seed:              seed,
+			Persist:           persist,
 		}
 	}
 	return out

@@ -92,11 +92,17 @@ func TestInMemoryStateProposeCommitFinalize(t *testing.T) {
 	if got := s.RawReadLatestFinalizedBlock(); got == nil || *got != types.GENESIS_SEQ_NUM {
 		t.Fatalf("latest finalized = %v, want genesis", got)
 	}
-	if _, err := s.GetExecutionResult(blocks[0].GetId(), 1, true); err == nil {
-		t.Fatal("expected error for uncommitted block")
+	// Rust get_execution_result falls back to the proposals map when
+	// seq_num > latest_finalized — a proposed block already counts.
+	if _, err := s.GetExecutionResult(blocks[0].GetId(), 1, true); err != nil {
+		t.Fatalf("proposed block should resolve via proposals map: %v", err)
 	}
 	if _, err := s.GetExecutionResult(blocks[0].GetId(), 1, false); err != nil {
 		t.Fatalf("proposed GetExecutionResult: %v", err)
+	}
+	// a never-proposed block is the only error case
+	if _, err := s.GetExecutionResult(types.BlockId{}, 1, true); err == nil {
+		t.Fatal("expected error for unknown block")
 	}
 
 	for _, b := range blocks {
@@ -126,8 +132,13 @@ func TestInMemoryStateProposedNotFinalized(t *testing.T) {
 	author := types.NewNodeId(testutil.GetKey(0).PubKey())
 	b := makeBlock(t, 1, 1, types.GENESIS_BLOCK_ID, types.GENESIS_ROUND, author, kp)
 	s.LedgerPropose(b.GetId(), 1, 1, types.GENESIS_BLOCK_ID, nil)
-	if _, err := s.GetExecutionResult(b.GetId(), 1, true); err == nil {
-		t.Fatal("expected finalized error for merely-proposed block")
+	// Rust: seq 1 > latest_finalized(0) → proposals fallback resolves it.
+	if _, err := s.GetExecutionResult(b.GetId(), 1, true); err != nil {
+		t.Fatalf("proposed block resolves via proposals map: %v", err)
+	}
+	// genesis resolves from commits inside the finalized window.
+	if _, err := s.GetExecutionResult(types.GENESIS_BLOCK_ID, types.GENESIS_SEQ_NUM, true); err != nil {
+		t.Fatalf("genesis resolves from commits: %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ package blocktree
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"github.com/abhijitkrm/monadbft-go/chaincfg"
 	"github.com/abhijitkrm/monadbft-go/crypto"
@@ -130,6 +131,135 @@ func (PassthruBlockPolicy) GetExpectedExecutionResults(types.SeqNum, []*cstypes.
 }
 func (PassthruBlockPolicy) UpdateCommittedBlock(*cstypes.ConsensusFullBlock) {}
 func (PassthruBlockPolicy) Reset([]*cstypes.ConsensusFullBlock)              {}
+
+// MockBlockPolicy — minimal EthBlockPolicy port for tests: tracks a committed
+// seq→block-id index so get_expected_execution_results resolves the block at
+// `seq - execution_delay` exactly like Rust's committed_cache+extending lookup.
+// Proposals then embed that delayed result, which is what restart/state-sync
+// recovery reads from the forkpoint root block.
+type MockBlockPolicy struct {
+	ExecutionDelay types.SeqNum
+	lastCommit     types.SeqNum
+	committed      map[types.SeqNum]types.BlockId
+}
+
+func NewMockBlockPolicy(executionDelay types.SeqNum) *MockBlockPolicy {
+	return &MockBlockPolicy{
+		ExecutionDelay: executionDelay,
+		lastCommit:     types.GENESIS_SEQ_NUM,
+		committed:      map[types.SeqNum]types.BlockId{},
+	}
+}
+
+func (p *MockBlockPolicy) CheckCoherency(
+	block *cstypes.ConsensusFullBlock,
+	extending []*cstypes.ConsensusFullBlock,
+	root RootInfo,
+	stateRead ExecutionStateRead,
+	_ chaincfg.Config,
+) error {
+	var extSeqNum types.SeqNum
+	var extTs types.U128
+	if len(extending) > 0 {
+		extSeqNum = extending[len(extending)-1].Header.SeqNum
+		extTs = extending[len(extending)-1].Header.TimestampNs
+	} else {
+		extSeqNum = root.SeqNum
+	}
+	if block.Header.SeqNum != extSeqNum+1 {
+		return ErrBlockNotCoherent
+	}
+	if block.Header.TimestampNs.Cmp(extTs) <= 0 {
+		return ErrTimestamp
+	}
+	expected, err := p.GetExpectedExecutionResults(block.Header.SeqNum, extending, stateRead)
+	if err != nil {
+		return err
+	}
+	if !finalizedHeadersEqual(block.Header.DelayedExecutionResults, expected) {
+		return ErrExecutionResultMismatch
+	}
+	return nil
+}
+
+// GetExpectedExecutionResults — Rust EthBlockPolicy::get_expected_execution_
+// results: the execution result for block_seq_num - execution_delay, resolved
+// via the extending branch first then the committed index.
+func (p *MockBlockPolicy) GetExpectedExecutionResults(
+	blockSeqNum types.SeqNum,
+	extending []*cstypes.ConsensusFullBlock,
+	stateRead ExecutionStateRead,
+) ([]exec.FinalizedHeader, error) {
+	if blockSeqNum.Uint64() < p.ExecutionDelay.Uint64() {
+		return nil, nil
+	}
+	baseSeqNum := blockSeqNum.Sub(p.ExecutionDelay)
+
+	// get_block_index: committed chain first (base <= last_commit, genesis
+	// special-cased), else the extending branch (unfinalized).
+	var blockID types.BlockId
+	isFinalized := false
+	if baseSeqNum <= p.lastCommit {
+		isFinalized = true
+		if baseSeqNum == types.GENESIS_SEQ_NUM {
+			blockID = types.GENESIS_BLOCK_ID
+		} else {
+			id, ok := p.committed[baseSeqNum]
+			if !ok {
+				panic(fmt.Sprintf("blocktree: queried recently committed block that doesn't exist, base=%d last_commit=%d", baseSeqNum, p.lastCommit))
+			}
+			blockID = id
+		}
+	} else {
+		if extending == nil {
+			return nil, ErrNotAvailableYet
+		}
+		found := false
+		for _, blk := range extending {
+			if blk.GetSeqNum() == baseSeqNum {
+				blockID = blk.GetId()
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, ErrNotAvailableYet
+		}
+	}
+	res, err := stateRead.GetExecutionResult(blockID, baseSeqNum, isFinalized)
+	if err != nil {
+		return nil, err
+	}
+	return []exec.FinalizedHeader{res}, nil
+}
+
+// UpdateCommittedBlock — Rust update_committed_block: index the canonical
+// commit, keeping a window of 2*execution_delay for base-seq lookups.
+func (p *MockBlockPolicy) UpdateCommittedBlock(block *cstypes.ConsensusFullBlock) {
+	if block.GetSeqNum() != p.lastCommit+1 {
+		// Rust asserts strict +1 ordering on commits.
+		panic(fmt.Sprintf("blocktree: committed seq %d does not follow %d", block.GetSeqNum(), p.lastCommit))
+	}
+	p.lastCommit = block.GetSeqNum()
+	p.committed[block.GetSeqNum()] = block.GetId()
+	minSeq := block.GetSeqNum().SaturatingSub(p.ExecutionDelay.Mul(2))
+	for seq := range p.committed {
+		if seq < minSeq {
+			delete(p.committed, seq)
+		}
+	}
+}
+
+// Reset — Rust reset: reseed the committed index from the last 2*delay
+// committed blocks (restart path).
+func (p *MockBlockPolicy) Reset(lastDelayCommitted []*cstypes.ConsensusFullBlock) {
+	p.committed = map[types.SeqNum]types.BlockId{}
+	p.lastCommit = types.GENESIS_SEQ_NUM
+	for _, blk := range lastDelayCommitted {
+		p.committed[blk.GetSeqNum()] = blk.GetId()
+		p.lastCommit = blk.GetSeqNum()
+	}
+}
 
 // BlockValidator — Rust BlockValidator trait: validates a proposed
 // header+body into a policy-validated block.

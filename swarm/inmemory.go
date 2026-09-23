@@ -152,6 +152,13 @@ func (s *InMemoryState) LedgerCommit(blockID types.BlockId, seqNum types.SeqNum)
 		panic(fmt.Sprintf("committed proposal that doesn't exist, block_id=%x", blockID[:8]))
 	}
 	delete(s.proposals, blockID)
+	// Rust: proposals.retain(|_, p| p.round >= committed.round) — drop stale
+	// proposals so get_execution_result can't resurrect orphaned branches.
+	for id, p := range s.proposals {
+		if p.Round < committedProposal.Round {
+			delete(s.proposals, id)
+		}
+	}
 
 	lastSeq, lastOk := s.latestFinalized()
 	if !lastOk {
@@ -172,11 +179,7 @@ func (s *InMemoryState) LedgerCommit(blockID types.BlockId, seqNum types.SeqNum)
 // Under MockExecutionProtocol the finalized header only carries the seq_num.
 func (s *InMemoryState) GetExecutionResult(blockID types.BlockId, seqNum types.SeqNum, isFinalized bool) (exec.FinalizedHeader, error) {
 	var block *InMemoryBlockState
-	if isFinalized {
-		latest, ok := s.latestFinalized()
-		if !ok || latest.Uint64() < seqNum.Uint64() {
-			return nil, ErrNotAvailableYet
-		}
+	if latest, ok := s.latestFinalized(); isFinalized && ok && latest.Uint64() >= seqNum.Uint64() {
 		if earliest, ok := s.earliestFinalized(); ok && earliest.Uint64() > seqNum.Uint64() {
 			return nil, ErrNeverAvailable
 		}
@@ -185,6 +188,8 @@ func (s *InMemoryState) GetExecutionResult(blockID types.BlockId, seqNum types.S
 			panic("finalized block missing from commits")
 		}
 	} else {
+		// Rust falls back to the proposals map — a proposed-but-not-yet-
+		// committed block still counts (covers finalization-delay lag).
 		p, ok := s.proposals[blockID]
 		if !ok {
 			return nil, ErrNotAvailableYet

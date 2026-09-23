@@ -1,9 +1,11 @@
 package swarm
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"time"
 
+	"github.com/abhijitkrm/monadbft-go/exec"
 	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/monadstate"
 )
@@ -84,6 +86,8 @@ type Node struct {
 	rng         *rand.ChaCha8
 	currentSeed uint64
 	nonce       int
+
+	persist *Persistence
 }
 
 // NodeBuilder — Rust NodeBuilder.
@@ -99,12 +103,27 @@ type NodeBuilder struct {
 	InboundPipeline   Pipeline
 	TimestamperConfig TimestamperConfig
 	Seed              [32]byte
+
+	// Persist — when set, enables WAL + block store + forkpoint files under
+	// Persist.Dir; pointing a rebuilt node at the same Dir is the restart path.
+	Persist *PersistSpec
 }
 
 // Build — Rust NodeBuilder::build: construct node, run init commands through
-// the executor.
+// the executor. With Persist, the config-file/ledger executors are durable;
+// a rebuilt node resumes from the persisted forkpoint and block store.
 func (b NodeBuilder) Build(tick time.Duration) *Node {
-	state, initCmds := b.StateBuilder.Build()
+	var persist *Persistence
+	if b.Persist != nil {
+		p, err := b.Persist.open(exec.Mock)
+		if err != nil {
+			panic(fmt.Sprintf("swarm: open persistence: %v", err))
+		}
+		persist = p
+		if ml, ok := b.Ledger.(*MockLedger); ok {
+			ml.WithBlockStore(persist.Blocks)
+		}
+	}
 	executor := NewMockExecutor(
 		b.RouterScheduler,
 		b.ValSetUpdater,
@@ -114,8 +133,12 @@ func (b NodeBuilder) Build(tick time.Duration) *Node {
 		b.TimestamperConfig,
 		tick,
 	)
+	if persist != nil {
+		executor.WithConfigFile(persist.ConfigFile)
+	}
+	state, initCmds := b.StateBuilder.Build()
 	executor.Exec(initCmds)
-	return &Node{
+	node := &Node{
 		ID:               b.ID,
 		Executor:         executor,
 		State:            state,
@@ -123,7 +146,9 @@ func (b NodeBuilder) Build(tick time.Duration) *Node {
 		InboundPipeline:  b.InboundPipeline,
 		pendingInbound:   newPendingQueue(),
 		rng:              rand.NewChaCha8(b.Seed),
+		persist:          persist,
 	}
+	return node
 }
 
 func (n *Node) updateRNG() { n.currentSeed = n.rng.Uint64() }
@@ -188,6 +213,9 @@ func (n *Node) StepUntil(until time.Duration, emitted *[]ScheduledOutbound) (tim
 				continue
 			}
 			if !execEv.IsSend {
+				if n.persist != nil {
+					n.persist.logEvent(execEv.Event) // append before dispatch
+				}
 				cmds := n.State.Update(execEv.Event)
 				n.Executor.Exec(cmds)
 				return tick, execEv.Event, true

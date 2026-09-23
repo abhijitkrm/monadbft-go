@@ -239,6 +239,20 @@ func (b ConsensusFullBlock) EncodeRLP(dst []byte) []byte {
 	})
 }
 
+func (b *ConsensusFullBlock) DecodeRLP(s *rlp.Stream, ep *exec.Protocol) error {
+	l, err := s.List()
+	if err != nil {
+		return err
+	}
+	if err := b.Header.DecodeRLP(l, ep); err != nil {
+		return err
+	}
+	if err := b.Body.DecodeRLP(l, ep); err != nil {
+		return err
+	}
+	return l.Done()
+}
+
 func (b ConsensusFullBlock) GetId() types.BlockId       { return b.Header.GetId() }
 func (b ConsensusFullBlock) GetParentId() types.BlockId { return b.Header.GetParentId() }
 func (b ConsensusFullBlock) GetSeqNum() types.SeqNum    { return b.Header.SeqNum }

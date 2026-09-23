@@ -9,9 +9,14 @@ import (
 //
 // Emits ValidatorEvent::UpdateValidators carrying the genesis validator set at
 // every epoch boundary — the "nop" updater: membership never actually changes.
+//
+// Rust keeps a single next_val_data slot and overwrites (with an error log)
+// when boundary notifications batch — losing intermediate epoch updates. That
+// can happen on restart buffer-fill commits; here we queue them so no locked
+// epoch's validator set is ever dropped.
 type MockValSetUpdaterNop struct {
 	genesisValidatorData glue.ValidatorSetData
-	nextValData          *glue.ValidatorSetDataWithEpoch
+	pending              []glue.ValidatorSetDataWithEpoch
 	epochLength          types.SeqNum
 	enableUpdates        bool
 }
@@ -38,15 +43,11 @@ func (v *MockValSetUpdaterNop) jankUpdateValset(seqNum types.SeqNum) {
 	if !seqNum.IsBoundaryBlock(v.epochLength) {
 		return
 	}
-	if v.nextValData != nil {
-		// Rust logs an error here ("Validator set data is not consumed") but
-		// proceeds to overwrite — same behavior.
-	}
 	lockedEpoch := seqNum.GetLockedEpoch(v.epochLength)
-	v.nextValData = &glue.ValidatorSetDataWithEpoch{
+	v.pending = append(v.pending, glue.ValidatorSetDataWithEpoch{
 		Epoch:      lockedEpoch,
 		Validators: v.genesisValidatorData,
-	}
+	})
 }
 
 // Exec — Rust Executor::exec(ValSetCommand).
@@ -61,7 +62,7 @@ func (v *MockValSetUpdaterNop) Exec(cmds []glue.ValSetCommand) {
 
 // Ready — Rust MockableValSetUpdater::ready.
 func (v *MockValSetUpdaterNop) Ready() bool {
-	return v.enableUpdates && v.nextValData != nil
+	return v.enableUpdates && len(v.pending) > 0
 }
 
 // GetValidatorSetData — Rust get_validator_set_data (always genesis set).
@@ -71,10 +72,10 @@ func (v *MockValSetUpdaterNop) GetValidatorSetData(_ types.Epoch) glue.Validator
 
 // Next — Rust Stream::next → MonadEvent::ValidatorEvent(UpdateValidators).
 func (v *MockValSetUpdaterNop) Next() glue.MonadEvent {
-	if !v.enableUpdates || v.nextValData == nil {
+	if !v.enableUpdates || len(v.pending) == 0 {
 		return nil
 	}
-	data := v.nextValData
-	v.nextValData = nil
-	return glue.EvUpdateValidators{ValidatorSetDataWithEpoch: *data}
+	data := v.pending[0]
+	v.pending = v.pending[1:]
+	return glue.EvUpdateValidators{ValidatorSetDataWithEpoch: data}
 }

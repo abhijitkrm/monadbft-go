@@ -152,10 +152,17 @@ type RoundTimer struct {
 	TimesOutAt     time.Duration
 }
 
+// ConfigFilePersister — the config-file executor seam: MockConfigFile for
+// pure-in-memory tests, store.ConfigFile for durable forkpoint/valset writes.
+type ConfigFilePersister interface {
+	Exec([]glue.ConfigFileCommand)
+	LastCheckpoint() *cstypes.Checkpoint
+}
+
 // MockExecutor owns every per-node updater and advances deterministic time.
 type MockExecutor struct {
 	ledger     Ledger
-	configFile *MockConfigFile
+	configFile ConfigFilePersister
 	valSet     ValSetUpdater
 	loopback   *LoopbackExecutor
 	txpool     TxPool
@@ -191,9 +198,15 @@ func NewMockExecutor(
 	}
 }
 
+// WithConfigFile swaps in a durable ConfigFile persister (A3 persistence).
+func (e *MockExecutor) WithConfigFile(cf ConfigFilePersister) *MockExecutor {
+	e.configFile = cf
+	return e
+}
+
 // Checkpoint — Rust checkpoint() (the config_file's last written checkpoint).
 func (e *MockExecutor) Checkpoint() *cstypes.Checkpoint {
-	return e.configFile.Checkpoint
+	return e.configFile.LastCheckpoint()
 }
 
 // NextRoundTimeout — Rust next_round_timeout (pacemaker timer introspection).

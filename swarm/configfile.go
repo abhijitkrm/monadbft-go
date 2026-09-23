@@ -16,6 +16,9 @@ type MockConfigFile struct {
 
 func NewMockConfigFile() *MockConfigFile { return &MockConfigFile{} }
 
+// LastCheckpoint — ConfigFilePersister.
+func (c *MockConfigFile) LastCheckpoint() *cstypes.Checkpoint { return c.Checkpoint }
+
 // Exec — Rust Executor::exec(ConfigFileCommand).
 func (c *MockConfigFile) Exec(cmds []glue.ConfigFileCommand) {
 	for _, cmd := range cmds {

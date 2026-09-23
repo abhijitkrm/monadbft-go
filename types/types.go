@@ -51,6 +51,24 @@ func (r Round) Add(o Round) Round    { return Round(uint64(r) + uint64(o)) }
 func (r Round) Sub(o Round) Round    { return Round(uint64(r) - uint64(o)) }
 func (s SeqNum) Add(o SeqNum) SeqNum { return SeqNum(uint64(s) + uint64(o)) }
 func (s SeqNum) Sub(o SeqNum) SeqNum { return SeqNum(uint64(s) - uint64(o)) }
+func (s SeqNum) Mul(o SeqNum) SeqNum { return SeqNum(uint64(s) * uint64(o)) }
+
+// SaturatingAdd — Rust SeqNum::saturating_add.
+func (s SeqNum) SaturatingAdd(o SeqNum) SeqNum {
+	r := uint64(s) + uint64(o)
+	if r < uint64(s) {
+		return SeqNum(^uint64(0))
+	}
+	return SeqNum(r)
+}
+
+// SaturatingSub — Rust SeqNum::saturating_sub.
+func (s SeqNum) SaturatingSub(o SeqNum) SeqNum {
+	if uint64(s) < uint64(o) {
+		return 0
+	}
+	return s - o
+}
 
 // ImmediatelyFollows — Rust Round::immediately_follows: self == prev + 1
 // (checked_add, so prev == MAX is false).

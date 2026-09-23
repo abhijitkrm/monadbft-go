@@ -1,11 +1,13 @@
 package swarm
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/abhijitkrm/monadbft-go/blocksync"
 	"github.com/abhijitkrm/monadbft-go/cstypes"
 	"github.com/abhijitkrm/monadbft-go/glue"
+	"github.com/abhijitkrm/monadbft-go/store"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
@@ -22,6 +24,7 @@ type MockLedger struct {
 
 	finalizationDelay types.SeqNum
 	stateRead         *InMemoryState
+	blockStore        *store.BlockStore // optional durable mirror
 }
 
 var _ EventSource = (*MockLedger)(nil)
@@ -47,6 +50,36 @@ func (l *MockLedger) WithBlocks(old *MockLedger) *MockLedger {
 	return l
 }
 
+// WithBlockStore mirrors every ledger block write into the durable store and
+// seeds the in-memory maps from it — the restart path that replaces
+// with_blocks when the process is actually killed.
+func (l *MockLedger) WithBlockStore(bs *store.BlockStore) *MockLedger {
+	l.blockStore = bs
+	if bs == nil {
+		return l
+	}
+	if blocks, err := bs.AllBlocks(); err == nil {
+		for _, b := range blocks {
+			l.blocks[b.GetId()] = b
+		}
+	}
+	if fins, err := bs.FinalizedBlocks(); err == nil {
+		for _, b := range fins {
+			l.committedBlocks[b.GetSeqNum()] = b
+		}
+	}
+	return l
+}
+
+func (l *MockLedger) putBlock(b *cstypes.ConsensusFullBlock) {
+	l.blocks[b.GetId()] = b
+	if l.blockStore != nil {
+		if err := l.blockStore.PutBlock(b); err != nil {
+			panic(fmt.Sprintf("mockledger: block store write: %v", err))
+		}
+	}
+}
+
 // Exec — Rust Executor::exec(LedgerCommand).
 func (l *MockLedger) Exec(cmds []glue.LedgerCommand) {
 	for _, cmd := range cmds {
@@ -56,10 +89,10 @@ func (l *MockLedger) Exec(cmds []glue.LedgerCommand) {
 			case glue.CommitProposed:
 				b := c.Commit.Block
 				l.stateRead.LedgerPropose(b.GetId(), b.GetSeqNum(), b.GetBlockRound(), b.GetParentId(), nil)
-				l.blocks[b.GetId()] = b
+				l.putBlock(b)
 			case glue.CommitVoted:
 				b := c.Commit.Block
-				l.blocks[b.GetId()] = b
+				l.putBlock(b)
 			case glue.CommitFinalized:
 				l.commitFinalized(c.Commit.Block)
 			}
@@ -84,6 +117,14 @@ func (l *MockLedger) commitFinalized(block *cstypes.ConsensusFullBlock) {
 		if block.GetSeqNum() == finalizeSeqNum {
 			l.committedBlocks[block.GetSeqNum()] = block
 			l.stateRead.LedgerCommit(block.GetId(), block.GetSeqNum())
+			if l.blockStore != nil {
+				if err := l.blockStore.PutBlock(block); err != nil {
+					panic(fmt.Sprintf("mockledger: block store write: %v", err))
+				}
+				if err := l.blockStore.PutFinalized(block.GetSeqNum(), block.GetId()); err != nil {
+					panic(fmt.Sprintf("mockledger: finalized write: %v", err))
+				}
+			}
 			return
 		}
 		next, ok := l.blocks[block.GetParentId()]
