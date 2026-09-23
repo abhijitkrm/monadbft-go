@@ -486,3 +486,178 @@ func TestSwarmConsensusProgress(t *testing.T) {
 	}
 	SwarmLedgerVerification(nodes, target)
 }
+
+// TestBlockSyncCatchUp — ports Rust bsync_timeout_recovery: partition node 0
+// (its outbound dropped) while peers finalize ≥10 blocks; then unblock
+// consensus traffic but keep dropping block-sync messages (node sees the
+// new tip but cannot fetch it); finally unblock everything — node must
+// blocksync the missing chain and converge.
+func TestBlockSyncCatchUp(t *testing.T) {
+	delta := 20 * time.Millisecond
+	nodes, allPeers := buildTestSwarm(t, 4, delta, types.SeqNum(^uint64(0)))
+	partitioned := NewID(allPeers[0])
+
+	outbound := func(dropBlockSync, partition bool) Pipeline {
+		var p TransformerPipeline
+		if dropBlockSync {
+			p = append(p, &BytesFilterTransformer{DropBlockSync: true, EP: exec.Mock})
+		}
+		p = append(p, NewLatencyTransformer(delta))
+		if partition {
+			p = append(p, NewPartitionTransformer(partitioned), NewDropTransformer())
+		}
+		return p
+	}
+	nodes.UpdateOutboundPipelineForAll(outbound(true, true))
+
+	runFor := func(d time.Duration) {
+		term := NewUntilTerminator().UntilTick(nodes.Tick() + d)
+		for {
+			if _, _, _, ok := nodes.StepUntil(term); !ok {
+				break
+			}
+		}
+	}
+	finalized := func(id ID) int {
+		return nodes.Node(id).Executor.Ledger().FinalizedBlocksLen()
+	}
+
+	// phase 1: partitioned — peers progress, node 0 stalls
+	runFor(5 * time.Second)
+	if got := finalized(partitioned); got != 0 {
+		t.Fatalf("partitioned node finalized %d blocks, want 0", got)
+	}
+	for _, p := range allPeers[1:] {
+		if got := finalized(NewID(p)); got < 10 {
+			t.Fatalf("peer %v finalized %d blocks, want >=10", p.PubKey.String()[:8], got)
+		}
+	}
+
+	// phase 2: unpartitioned but block-sync still filtered — node 0 sees the
+	// tip but cannot fetch missing ancestors, stays behind
+	nodes.UpdateOutboundPipelineForAll(outbound(true, false))
+	runFor(5 * time.Second)
+	if got := finalized(partitioned); got != 0 {
+		t.Fatalf("filtered node finalized %d blocks, want 0", got)
+	}
+
+	// phase 3: everything flows — node 0 catches up via block-sync
+	nodes.UpdateOutboundPipelineForAll(outbound(false, false))
+	runFor(30 * time.Second)
+	SwarmLedgerVerification(nodes, 10)
+}
+
+// TestSwarmEpochTransition — 4 nodes with a short epoch length must schedule
+// the next epoch at the boundary block's round + epoch_start_delay and all
+// cross into epoch 2+, with converged ledgers. Mirrors Rust epoch.rs.
+func TestSwarmEpochTransition(t *testing.T) {
+	const epochLen = 20
+	const epochStartDelay = types.Round(5)
+	delta := 10 * time.Millisecond
+
+	cc := MockChainConfig()
+	cc.EpochLength = types.SeqNum(epochLen)
+	cc.EpochStartDelay = epochStartDelay
+
+	gv, builders := MakeStateConfigs(4, StateConfigParams{
+		ExecutionDelay:     types.SeqNum(^uint64(0)),
+		Delta:              delta,
+		ChainConfig:        cc,
+		StatesyncThreshold: types.SeqNum(1000),
+		LeaderElection:     func() validator.LeaderElection { return validator.WeightedRoundRobin{} },
+		BlockValidator:     func() blocktree.BlockValidator { return blocktree.MockValidator{} },
+		BlockPolicy:        func() blocktree.BlockPolicy { return blocktree.PassthruBlockPolicy{} },
+		StateRead:          func() blocktree.ExecutionStateRead { return NewInMemoryStateGenesis(types.SeqNum(^uint64(0))) },
+	})
+	allPeers := make([]types.NodeId, 4)
+	for i, k := range gv.Keys {
+		allPeers[i] = types.NewNodeId(k.PubKey())
+	}
+	sort.Slice(allPeers, func(i, j int) bool { return allPeers[i].Cmp(allPeers[j]) < 0 })
+
+	nodes := NewBytesSwarm(SwarmConfig{
+		Builders:   builders,
+		Genesis:    gv,
+		AllPeerIDs: allPeers,
+		OutPipeline: func() Pipeline {
+			return TransformerPipeline{NewLatencyTransformer(delta)}
+		},
+		InPipeline:        func() Pipeline { return TransformerPipeline{} },
+		EpochLength:       types.SeqNum(epochLen),
+		EP:                exec.Mock,
+		Timestamper:       DefaultTimestamperConfig(),
+		FinalizationDelay: 0,
+	}).Build()
+
+	// drive until every node reaches epoch >= 3 (two full transitions)
+	term := NewUntilTerminator().UntilEpoch(types.Epoch(3)).UntilTick(10 * time.Minute)
+	for {
+		if _, _, _, ok := nodes.StepUntil(term); !ok {
+			break
+		}
+	}
+
+	for _, nd := range nodes.OrderedNodes() {
+		cs := nd.State.Consensus()
+		ep, ok := nd.State.EpochManager().GetEpoch(cs.Consensus.GetCurrentRound())
+		if !ok {
+			t.Fatalf("node %v: epoch lookup failed", nd.ID.PeerID.PubKey.String()[:8])
+		}
+		if ep < types.Epoch(3) {
+			t.Fatalf("node %v stuck in epoch %v", nd.ID.PeerID.PubKey.String()[:8], ep)
+		}
+	}
+	SwarmLedgerVerification(nodes, epochLen)
+}
+
+// TestSwarmVariableLatency — progress under non-uniform per-pair latency
+// (XorLatency outbound). Mirrors Rust rand_lat-style coverage.
+func TestSwarmVariableLatency(t *testing.T) {
+	delta := 20 * time.Millisecond
+	execDelay := types.SeqNum(4)
+	gv, builders := MakeStateConfigs(4, StateConfigParams{
+		ExecutionDelay:     execDelay,
+		Delta:              delta,
+		ChainConfig:        MockChainConfig(),
+		StatesyncThreshold: types.SeqNum(100),
+		LeaderElection:     func() validator.LeaderElection { return validator.WeightedRoundRobin{} },
+		BlockValidator:     func() blocktree.BlockValidator { return blocktree.MockValidator{} },
+		BlockPolicy:        func() blocktree.BlockPolicy { return blocktree.PassthruBlockPolicy{} },
+		StateRead:          func() blocktree.ExecutionStateRead { return NewInMemoryStateGenesis(execDelay) },
+	})
+	allPeers := make([]types.NodeId, 4)
+	for i, k := range gv.Keys {
+		allPeers[i] = types.NewNodeId(k.PubKey())
+	}
+	sort.Slice(allPeers, func(i, j int) bool { return allPeers[i].Cmp(allPeers[j]) < 0 })
+
+	nodes := NewBytesSwarm(SwarmConfig{
+		Builders:   builders,
+		Genesis:    gv,
+		AllPeerIDs: allPeers,
+		OutPipeline: func() Pipeline {
+			return TransformerPipeline{
+				NewXorLatencyTransformer(delta),
+				NewRandLatencyTransformer(DefaultSeed(7), delta),
+			}
+		},
+		InPipeline:        func() Pipeline { return TransformerPipeline{} },
+		EpochLength:       types.SeqNum(2000),
+		EP:                exec.Mock,
+		Timestamper:       DefaultTimestamperConfig(),
+		FinalizationDelay: 0,
+	}).Build()
+
+	const target = 8
+	monitor := map[ID]int{}
+	for _, p := range allPeers {
+		monitor[NewID(p)] = target
+	}
+	term := NewProgressTerminator(monitor, 10*time.Minute)
+	for {
+		if _, _, _, ok := nodes.StepUntil(term); !ok {
+			break
+		}
+	}
+	SwarmLedgerVerification(nodes, target)
+}

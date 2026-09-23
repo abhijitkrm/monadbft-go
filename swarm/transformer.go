@@ -5,6 +5,9 @@ import (
 	"sort"
 	"time"
 
+	"github.com/abhijitkrm/monadbft-go/exec"
+	"github.com/abhijitkrm/monadbft-go/glue"
+	"github.com/abhijitkrm/monadbft-go/messages"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
@@ -278,6 +281,50 @@ func (t *DropTransformer) IsOutboundBlocked(_ time.Duration, node types.NodeId) 
 		return &b
 	}
 	return nil
+}
+
+// BytesFilterTransformer — port of monad-mock-swarm's FilterTransformer for
+// the byte-serialized transport: decodes the wire envelope to decide drops.
+// Consensus messages are decoded further to discriminate proposal/vote/
+// timeout. Undecodable bytes pass through (Rust only filters parseable msgs).
+type BytesFilterTransformer struct {
+	transformerBase
+	DropProposal  bool
+	DropVote      bool
+	DropTimeout   bool
+	DropBlockSync bool
+	EP            *exec.Protocol
+}
+
+func (t *BytesFilterTransformer) Transform(m LinkMessage) TransformerStream {
+	if t.drop(m.Message) {
+		return Complete()
+	}
+	return Continue(StreamMessage{Message: m})
+}
+
+func (t *BytesFilterTransformer) drop(msg []byte) bool {
+	env, err := glue.DecodeMonadMessage(msg, t.EP)
+	if err != nil {
+		return false
+	}
+	switch env.Kind {
+	case 1: // consensus
+		if env.Consensus == nil {
+			return false
+		}
+		switch env.Consensus.Obj.Message.Kind {
+		case messages.PMProposal:
+			return t.DropProposal
+		case messages.PMVote:
+			return t.DropVote
+		case messages.PMTimeout:
+			return t.DropTimeout
+		}
+	case 2, 3: // blocksync request / response
+		return t.DropBlockSync
+	}
+	return false
 }
 
 // PeriodicTransformer — only passes messages sent in [start, end).
