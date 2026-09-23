@@ -195,20 +195,35 @@ func (u Unverified) Verify() (Verified, error) {
 	return Verified{Author: types.NewNodeId(pk), Message: u}, nil
 }
 
-// Verified — Rust Verified<ST, Validated<M>>: author + the Unverified.
+// Verified — Rust Verified<ST, Unvalidated<M>>: author + the Unverified
+// (signature verified, but protocol structure not yet validated).
 type Verified struct {
 	Author  types.NodeId
 	Message Unverified
 }
 
-// Sign produces the Verified message (Rust: ConsensusMessage::sign →
+// Validated — Rust Verified<ST, Validated<ConsensusMessage>>: signature-
+// verified AND protocol-validated. Produced by Sign (self-produced ⇒ trusted)
+// or by the validation layer after Validate(). Same wire form as Verified;
+// the Validated wrapper is the type-state marker that Rust uses to gate
+// rebroadcast (VerifiedMonadMessage::Consensus) and consensus handlers.
+type Validated struct{ Verified }
+
+// AsValidated marks an already-Verified message as validated (trusted origin).
+func AsValidated(v Verified) Validated { return Validated{v} }
+
+// Sign produces a validated Verified message (Rust ConsensusMessage::sign →
 // Verified::new over the validated consensus message).
-func Sign(msg ConsensusMessage, kp *crypto.SecpKeyPair) Verified {
+func Sign(msg ConsensusMessage, kp *crypto.SecpKeyPair) Validated {
 	sig := kp.Sign(crypto.DomainConsensusMessage, msg.EncodeRLP(nil))
-	return Verified{
+	return Validated{Verified{
 		Author:  types.NewNodeId(kp.PubKey()),
 		Message: Unverified{Obj: msg, AuthorSignature: sig},
-	}
+	}}
 }
 
 func (v Verified) Obj() *ConsensusMessage { return &v.Message.Obj }
+
+// ToVerified drops the Validated marker (e.g. to embed the Unverified on wire).
+func (v Validated) ToVerified() Verified   { return v.Verified }
+func (v Validated) Obj() *ConsensusMessage { return v.Verified.Obj() }

@@ -47,6 +47,8 @@ type ConsensusEvents struct {
 	InvalidProposalRoundLeader   Counter
 	OutOfOrderProposals          Counter
 	ProposalWithTC               Counter
+	TriggerStateSync             Counter
+	CreatingProposal             Counter
 }
 
 // VoteDelay — Rust vote-delay percentile gauges.
@@ -56,8 +58,62 @@ type VoteDelay struct {
 	ReadyAfterTimerStartP99Ms Gauge
 }
 
+// ValidationErrors — Rust metrics::ValidationErrors.
+type ValidationErrors struct {
+	InvalidAuthor           Counter
+	NotWellFormedSig        Counter
+	InvalidSignature        Counter
+	InvalidTcRound          Counter
+	DuplicateTcTipRound     Counter
+	EmptySignersTcTipRound  Counter
+	TooManyTcTipRound       Counter
+	InsufficientStake       Counter
+	ValDataUnavailable      Counter
+	SignaturesDuplicateNode Counter
+	InvalidVoteMessage      Counter
+	InvalidVersion          Counter
+	InvalidEpoch            Counter
+}
+
+// BlocksyncEvents — Rust metrics::BlocksyncEvents.
+type BlocksyncEvents struct {
+	PeerHeadersRequest           Counter
+	PeerHeadersRequestSuccessful Counter
+	PeerHeadersRequestFailed     Counter
+	PeerPayloadRequest           Counter
+	PeerPayloadRequestSuccessful Counter
+	PeerPayloadRequestFailed     Counter
+
+	SelfHeadersRequest            Counter
+	SelfHeadersResponseSuccessful Counter
+	SelfHeadersResponseFailed     Counter
+	SelfPayloadRequest            Counter
+	SelfPayloadResponseSuccessful Counter
+	SelfPayloadResponseFailed     Counter
+	SelfPayloadRequestsInFlight   Gauge
+
+	HeadersResponseSuccessful Counter
+	HeadersResponseFailed     Counter
+	HeadersResponseUnexpected Counter
+	HeadersValidationFailed   Counter
+	PayloadResponseSuccessful Counter
+	PayloadResponseFailed     Counter
+	PayloadResponseUnexpected Counter
+	NumHeadersReceived        Counter
+	RequestTimeout            Counter
+	RequestFailedNoPeers      Counter
+}
+
+// NodeState — Rust metrics::NodeState.
+type NodeState struct {
+	SelfStakeBps Gauge
+}
+
 // Metrics — Rust metrics::Metrics.
 type Metrics struct {
-	ConsensusEvents ConsensusEvents
-	VoteDelay       VoteDelay
+	ConsensusEvents  ConsensusEvents
+	ValidationErrors ValidationErrors
+	BlocksyncEvents  BlocksyncEvents
+	NodeState        NodeState
+	VoteDelay        VoteDelay
 }

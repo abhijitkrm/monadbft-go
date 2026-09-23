@@ -45,6 +45,37 @@ type ConsensusBlockHeader struct {
 	BaseFeeMoment           uint64
 }
 
+// NewConsensusBlockHeader — Rust ConsensusBlockHeader::new (arg order preserved).
+func NewConsensusBlockHeader(
+	author types.NodeId,
+	epoch types.Epoch,
+	blockRound types.Round,
+	delayedExecutionResults []exec.FinalizedHeader,
+	executionInputs exec.ProposedHeader,
+	blockBodyId ConsensusBlockBodyId,
+	qc QuorumCertificate,
+	seqNum types.SeqNum,
+	timestampNs types.U128,
+	roundSignature RoundSignature,
+	baseFee, baseFeeTrend, baseFeeMoment uint64,
+) ConsensusBlockHeader {
+	return ConsensusBlockHeader{
+		Author:                  author,
+		Epoch:                   epoch,
+		BlockRound:              blockRound,
+		DelayedExecutionResults: delayedExecutionResults,
+		ExecutionInputs:         executionInputs,
+		BlockBodyId:             blockBodyId,
+		QC:                      qc,
+		SeqNum:                  seqNum,
+		TimestampNs:             timestampNs,
+		RoundSignature:          roundSignature,
+		BaseFee:                 baseFee,
+		BaseFeeTrend:            baseFeeTrend,
+		BaseFeeMoment:           baseFeeMoment,
+	}
+}
+
 func (h ConsensusBlockHeader) EncodeRLP(dst []byte) []byte {
 	return rlp.AppendList(dst, func(p []byte) []byte {
 		p = h.BlockRound.EncodeRLP(p)
@@ -213,6 +244,13 @@ func (b ConsensusFullBlock) GetParentId() types.BlockId { return b.Header.GetPar
 func (b ConsensusFullBlock) GetSeqNum() types.SeqNum    { return b.Header.SeqNum }
 func (b ConsensusFullBlock) GetBlockRound() types.Round { return b.Header.BlockRound }
 func (b ConsensusFullBlock) GetEpoch() types.Epoch      { return b.Header.Epoch }
+func (b ConsensusFullBlock) GetTimestamp() types.U128   { return b.Header.TimestampNs }
+func (b ConsensusFullBlock) GetBodyId() ConsensusBlockBodyId {
+	return b.Body.GetId()
+}
+func (b ConsensusFullBlock) GetExecutionResults() []exec.FinalizedHeader {
+	return b.Header.DelayedExecutionResults
+}
 
 // BlockRange — Rust BlockRange { last_block_id, num_blocks }.
 type BlockRange struct {
@@ -226,4 +264,18 @@ func (r BlockRange) EncodeRLP(dst []byte) []byte {
 		p = r.NumBlocks.EncodeRLP(p)
 		return p
 	})
+}
+
+func (r *BlockRange) DecodeRLP(s *rlp.Stream) error {
+	l, err := s.List()
+	if err != nil {
+		return err
+	}
+	if err := r.LastBlockId.DecodeRLP(l); err != nil {
+		return err
+	}
+	if err := r.NumBlocks.DecodeRLP(l); err != nil {
+		return err
+	}
+	return l.Done()
 }

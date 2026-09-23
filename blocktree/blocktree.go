@@ -23,10 +23,27 @@ type RootInfo struct {
 	TimestampNs types.U128
 }
 
-// ExecutionStateRead — seam for reading execution state (Rust trait).
-// v1 (sync execution): implement as a stub returning "not available".
+// ExecutionStateRead — seam for reading execution state (Rust
+// monad-execution-state-read::ExecutionStateRead).
 type ExecutionStateRead interface {
-	// placeholder for deferred-execution reads
+	// GetExecutionResult — Rust get_execution_result: the finalized execution
+	// result for block (block_id, seq_num), ErrNotAvailableYet if unknown.
+	GetExecutionResult(blockID types.BlockId, seqNum types.SeqNum, isFinalized bool) (exec.FinalizedHeader, error)
+	// RawReadEarliestFinalizedBlock — Rust raw_read_earliest_finalized_block.
+	RawReadEarliestFinalizedBlock() *types.SeqNum
+	// RawReadLatestFinalizedBlock — Rust raw_read_latest_finalized_block.
+	RawReadLatestFinalizedBlock() *types.SeqNum
+	// ReadValsetAtBlock — Rust read_valset_at_block: (secp pubkey, cert pubkey,
+	// stake) entries for `requestedEpoch` as observed at `blockNum`.
+	ReadValsetAtBlock(blockNum types.SeqNum, requestedEpoch types.Epoch) []ValidatorReadData
+}
+
+// ValidatorReadData — a read_valset_at_block entry: (node pubkey, cert pubkey,
+// stake). Kept in blocktree to avoid a validator->blocktree import cycle.
+type ValidatorReadData struct {
+	PubKey     [33]byte // secp256k1 compressed
+	CertPubKey [48]byte // BLS (compressed)
+	Stake      types.Stake
 }
 
 // BlockPolicy — Rust BlockPolicy trait.

@@ -196,7 +196,7 @@ func (h *harness) execCmds(src *node, cmds []consensusstate.Command) {
 
 // deliver routes one signed consensus message to its target(s) and returns
 // each recipient's resulting commands, tagged with the recipient.
-func (h *harness) deliver(target types.RouterTarget, msg messages.Verified) []nodeCmds {
+func (h *harness) deliver(target types.RouterTarget, msg messages.Validated) []nodeCmds {
 	var out []nodeCmds
 	deliver := func(dst *node) {
 		pm := msg.Obj().Message

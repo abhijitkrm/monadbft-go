@@ -88,11 +88,21 @@ func (q QuorumCertificate) GetBlockId() types.BlockId { return q.Info.ID }
 // round is consecutive to the parent block's QC round, the parent's parent
 // (qc_parent.qc.block_id) becomes committable — the pipelined 2-chain rule.
 func (q QuorumCertificate) GetCommittableId(qcParent *ConsensusFullBlock) *types.BlockId {
-	if q.GetBlockId() != qcParent.GetId() {
+	return q.getCommittableId(qcParent.GetId(), qcParent.Header.QC.Info.Round, qcParent.Header.QC.GetBlockId())
+}
+
+// GetCommittableIdForHeader — same rule but over a bare header (BlockBuffer
+// tracks headers, not full blocks). qc_parent MUST be the block self points to.
+func (q QuorumCertificate) GetCommittableIdForHeader(qcParent *ConsensusBlockHeader) *types.BlockId {
+	return q.getCommittableId(qcParent.GetId(), qcParent.QC.Info.Round, qcParent.QC.GetBlockId())
+}
+
+func (q QuorumCertificate) getCommittableId(parentId types.BlockId, parentQcRound types.Round, parentParentId types.BlockId) *types.BlockId {
+	if q.GetBlockId() != parentId {
 		panic("cstypes: qc doesn't point to parent block")
 	}
-	if q.Info.Round == qcParent.Header.QC.Info.Round+1 {
-		id := qcParent.Header.QC.GetBlockId()
+	if q.Info.Round == parentQcRound+1 {
+		id := parentParentId
 		return &id
 	}
 	return nil

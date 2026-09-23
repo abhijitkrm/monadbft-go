@@ -163,6 +163,15 @@ func (s BlsSignature) IsInfinity() bool {
 	return bytes.Equal(s.Compress(), BlsSignatureInfinity().Compress())
 }
 
+// Validate — Rust CertificateSignature::validate for BlsSignature =
+// sig_validate(true): subgroup + infinity check on the signature point.
+func (s BlsSignature) Validate() error {
+	if s.inner == nil || !s.inner.SigValidate(true) {
+		return ErrBlsBadEncoding
+	}
+	return nil
+}
+
 // BlsSignatureInfinity is the G2 identity (0xc0 followed by 95 zeros).
 func BlsSignatureInfinity() BlsSignature {
 	b := make([]byte, BlsSignatureCompressdLen)

@@ -232,12 +232,13 @@ func (h *HighExtendVote) DecodeRLP(s *rlp.Stream, ep decodeCtx) error {
 }
 
 func (h HighExtendVote) Rank() HighExtendRank {
-	return h.asHighExtend().Rank()
+	return h.AsHighExtend().Rank()
 }
 
-func (h HighExtendVote) GetQC() QuorumCertificate { return h.asHighExtend().GetQC() }
+func (h HighExtendVote) GetQC() QuorumCertificate { return h.AsHighExtend().GetQC() }
 
-func (h HighExtendVote) asHighExtend() HighExtend {
+// AsHighExtend — Rust From<HighExtendVote> for HighExtend (drops VoteSig).
+func (h HighExtendVote) AsHighExtend() HighExtend {
 	return HighExtend{IsTip: h.IsTip, Tip: h.Tip, QC: h.QC}
 }
 
@@ -443,7 +444,7 @@ func NewTimeoutCertificate(
 			order = append(order, key)
 		}
 		groups[key] = append(groups[key], sigcol.NodeSig{NodeId: tm.NodeId, Sig: tm.Timeout.TimeoutSignature})
-		if he := tm.Timeout.HighExtend.asHighExtend(); he.Rank().Cmp(highest.Rank()) > 0 {
+		if he := tm.Timeout.HighExtend.AsHighExtend(); he.Rank().Cmp(highest.Rank()) > 0 {
 			highest = he
 		}
 	}

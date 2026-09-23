@@ -50,6 +50,21 @@ func (s SeqNum) Uint64() uint64 { return uint64(s) }
 func (r Round) Add(o Round) Round    { return Round(uint64(r) + uint64(o)) }
 func (r Round) Sub(o Round) Round    { return Round(uint64(r) - uint64(o)) }
 func (s SeqNum) Add(o SeqNum) SeqNum { return SeqNum(uint64(s) + uint64(o)) }
+func (s SeqNum) Sub(o SeqNum) SeqNum { return SeqNum(uint64(s) - uint64(o)) }
+
+// ImmediatelyFollows — Rust Round::immediately_follows: self == prev + 1
+// (checked_add, so prev == MAX is false).
+func (r Round) ImmediatelyFollows(prev Round) bool {
+	return uint64(prev) != ^uint64(0) && uint64(r) == uint64(prev)+1
+}
+
+// SaturatingSub — Rust Round::saturating_sub.
+func (r Round) SaturatingSub(o Round) Round {
+	if uint64(r) < uint64(o) {
+		return 0
+	}
+	return r - o
+}
 
 func (s SeqNum) IsBoundaryBlock(epochLength SeqNum) bool {
 	return s.Uint64()%epochLength.Uint64() == epochLength.Uint64()-1
@@ -68,6 +83,15 @@ func (s SeqNum) IsEpochEnd(epochLength SeqNum) bool {
 func (s SeqNum) GetEpoch(epochLength SeqNum, n uint64) Epoch {
 	epoch := s.ToEpoch(epochLength)
 	return Epoch(epoch.Uint64() + n - 1)
+}
+
+// GetLockedEpoch — Rust SeqNum::get_locked_epoch. Only valid on a boundary
+// block: the epoch that becomes locked when `s` is finalized.
+func (s SeqNum) GetLockedEpoch(epochLength SeqNum) Epoch {
+	if !s.IsBoundaryBlock(epochLength) {
+		panic("get_locked_epoch on non-boundary block")
+	}
+	return s.ToEpoch(epochLength) + Epoch(1)
 }
 
 // ---- RLP ----

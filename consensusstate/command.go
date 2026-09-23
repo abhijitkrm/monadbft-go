@@ -29,7 +29,7 @@ type CmdEnterRound struct {
 // NOT guaranteed; retry is handled at the state-machine level.
 type CmdPublish struct {
 	Target  types.RouterTarget
-	Message messages.Verified
+	Message messages.Validated
 }
 
 // CmdPublishToFullNodes — disseminate to this validator's full-node group.
@@ -37,7 +37,7 @@ type CmdPublishToFullNodes struct {
 	Epoch         types.Epoch
 	Round         types.Round
 	BroadcastMode types.FullnodeBroadcastMode
-	Message       messages.Verified
+	Message       messages.Validated
 }
 
 // CmdSchedule — schedule a local round timeout for `Round` in `Duration`.
