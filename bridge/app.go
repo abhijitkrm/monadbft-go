@@ -94,6 +94,7 @@ type App struct {
 type resultEntry struct {
 	header  *EvmFinalizedHeader
 	blockID types.BlockId
+	txs     [][]byte
 }
 
 // NewApp wraps an ABCI application with genesis validator bookkeeping.
@@ -182,6 +183,14 @@ func (a *App) Height() int64 { return a.height }
 func (a *App) Result(h int64) *EvmFinalizedHeader {
 	if e, ok := a.results[h]; ok {
 		return e.header
+	}
+	return nil
+}
+
+// Txs — the tx list committed at height h (test/assertion seam).
+func (a *App) Txs(h int64) [][]byte {
+	if e, ok := a.results[h]; ok {
+		return e.txs
 	}
 	return nil
 }

@@ -135,6 +135,7 @@ func (l *Ledger) finalizeOne(block *cstypes.ConsensusFullBlock) {
 	l.app.results[seq] = resultEntry{
 		header:  &EvmFinalizedHeader{Number: h.SeqNum, AppHash: res.AppHash},
 		blockID: h.GetId(),
+		txs:     body.Txs,
 	}
 	l.committed[h.SeqNum] = block
 	if err := l.app.applyUpdates(res.ValidatorUpdates); err != nil {

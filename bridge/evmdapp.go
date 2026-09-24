@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -9,6 +10,7 @@ import (
 	abci "github.com/cometbft/cometbft/abci/types"
 
 	dbm "github.com/cosmos/cosmos-db"
+	ethsecp256k1 "github.com/cosmos/evm/crypto/ethsecp256k1"
 	"github.com/cosmos/evm/evmd"
 	srvflags "github.com/cosmos/evm/server/flags"
 	testconstants "github.com/cosmos/evm/testutil/constants"
@@ -20,7 +22,6 @@ import (
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client/flags"
-	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	"github.com/cosmos/cosmos-sdk/server"
 	simtestutil "github.com/cosmos/cosmos-sdk/testutil/sims"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -28,6 +29,7 @@ import (
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
 )
 
 // EvmdConfig — parameters for an in-process evmd instance.
@@ -37,15 +39,26 @@ type EvmdConfig struct {
 	Home       string // appOpts FlagHome (any path; MemDB means no disk use)
 }
 
+// GenesisSenderKey — the deterministic ethsecp256k1 key funding the genesis
+// account (every node derives the same sender → identical genesis). Tests
+// sign MsgEthereumTx with it.
+func GenesisSenderKey() *ethsecp256k1.PrivKey {
+	seed := sha256.Sum256([]byte("monadbft-bridge-sender-seed-001"))
+	return &ethsecp256k1.PrivKey{Key: seed[:]}
+}
+
 // NewEvmdApp constructs an evmd app on an in-memory DB and InitChains it with
 // a validator set + funding account — the same genesis shape as
 // evmd.SetupWithGenesisValSet. Returns the bridge App wrapper (valset
 // bookkeeping installed) and the raw app for test inspection.
 func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
+	// same option set as evmd's test harness (NewAppOptionsWithFlagHomeAndChainID)
 	appOptions := simtestutil.AppOptionsMap{
-		flags.FlagHome:            cfg.Home,
-		server.FlagInvCheckPeriod: 5,
-		srvflags.EVMChainID:       cfg.EVMChainID,
+		flags.FlagHome:                              cfg.Home,
+		server.FlagInvCheckPeriod:                   5,
+		srvflags.EVMChainID:                         cfg.EVMChainID,
+		srvflags.EVMMempoolInsertQueueSize:          5000,
+		srvflags.EVMMempoolPendingTxProposalTimeout: "250ms",
 	}
 	evmApp := evmd.NewExampleApp(
 		log.NewNopLogger(), dbm.NewMemDB(), true, appOptions,
@@ -55,12 +68,17 @@ func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
 	genesisState := evmApp.DefaultGenesis()
 
 	// one funded genesis account (the delegator for all validators) —
-	// deterministic so every node's genesis is byte-identical.
-	senderPrivKey := secp256k1.GenPrivKeyFromSecret([]byte("monadbft-bridge-sender-seed-001"))
+	// ethsecp256k1 so the account's SDK address equals its EVM address
+	// (tests can sign real MsgEthereumTx against it). Deterministic so
+	// every node's genesis is byte-identical.
+	senderPrivKey := GenesisSenderKey()
 	acc := authtypes.NewBaseAccount(senderPrivKey.PubKey().Address().Bytes(), senderPrivKey.PubKey(), 0, 0)
 	balance := banktypes.Balance{
 		Address: acc.GetAddress().String(),
-		Coins:   sdk.NewCoins(sdk.NewCoin(evmtypes.DefaultEVMExtendedDenom, math.NewInt(100000000000000))),
+		Coins: sdk.NewCoins(sdk.NewCoin(
+			testconstants.ChainsCoinInfo[cfg.EVMChainID].Denom,
+			math.NewInt(9_000_000_000_000_000_000),
+		)),
 	}
 
 	genesisState, err := simtestutil.GenesisStateWithValSet(
@@ -91,6 +109,14 @@ func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
 	evmApp.AppCodec().MustUnmarshalJSON(genesisState[evmtypes.ModuleName], &evmGenesis)
 	evmGenesis.Params.EvmDenom = testconstants.ChainsCoinInfo[cfg.EVMChainID].Denom
 	genesisState[evmtypes.ModuleName] = evmApp.AppCodec().MustMarshalJSON(&evmGenesis)
+
+	// test-chain fixup (same as evmd's integration test genesis): no EIP-1559
+	// base fee, so tx tests don't depend on fee-market dynamics. Bond/mint
+	// denoms stay default — the bonded pool is funded in stake.
+	var fmGen feemarkettypes.GenesisState
+	evmApp.AppCodec().MustUnmarshalJSON(genesisState[feemarkettypes.ModuleName], &fmGen)
+	fmGen.Params.NoBaseFee = true
+	genesisState[feemarkettypes.ModuleName] = evmApp.AppCodec().MustMarshalJSON(&fmGen)
 
 	// Seed x/slashing signing infos: GenesisStateWithValSet inserts validators
 	// already Bonded, so AfterValidatorBonded never fires — without this, the

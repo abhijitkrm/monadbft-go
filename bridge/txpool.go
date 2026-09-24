@@ -20,8 +20,9 @@ import (
 //   - BlockCommit/EnterRound/Reset → nop (the mempool's own hooks run inside
 //     FinalizeBlock)
 type TxPool struct {
-	app    *App
-	events []glue.MonadEvent
+	app      *App
+	events   []glue.MonadEvent
+	lastErrs []error
 }
 
 var _ swarm.TxPool = (*TxPool)(nil)
@@ -102,6 +103,8 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 }
 
 // insertTxs — CheckTx + InsertTx (the app-side mempool insert path).
+// Failures are captured in lastErrs for diagnostics (and dropped otherwise —
+// the mempool legitimately rejects txs).
 func (t *TxPool) insertTxs(txs [][]byte) {
 	ctx := context.Background()
 	for _, tx := range txs {
@@ -109,14 +112,23 @@ func (t *TxPool) insertTxs(txs [][]byte) {
 			Tx:   tx,
 			Type: abcitypes.CheckTxType_New,
 		})
-		if err != nil || res.Code != 0 {
+		if err != nil {
+			t.lastErrs = append(t.lastErrs, fmt.Errorf("CheckTx: %w", err))
+			continue
+		}
+		if res.Code != 0 {
+			t.lastErrs = append(t.lastErrs, fmt.Errorf("CheckTx code=%d: %s", res.Code, res.Log))
 			continue
 		}
 		if _, err := t.app.app.InsertTx(ctx, &abcitypes.RequestInsertTx{Tx: tx}); err != nil {
+			t.lastErrs = append(t.lastErrs, fmt.Errorf("InsertTx: %w", err))
 			continue
 		}
 	}
 }
+
+// LastErrs — recent CheckTx/InsertTx failures (test diagnostics).
+func (t *TxPool) LastErrs() []error { return t.lastErrs }
 
 // SendTransaction — swarm.TxPool: inject a tx into the mempool.
 func (t *TxPool) SendTransaction(tx []byte) { t.insertTxs([][]byte{tx}) }
