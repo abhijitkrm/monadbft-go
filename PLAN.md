@@ -206,13 +206,24 @@ blocksync, epoch transition, state-sync trigger.
 Consensus block store (pebble), WAL, forkpoint writer; crash-recovery tests
 (kill -9 mid-round, replay; no double-sign).
 
-**A4 — ABCI bridge + evmd**
-ABCI client (in-process `local` client against `evmd` app), adapter for
-PrepareProposal/ProcessProposal/FinalizeBlock/Commit/CheckTx/InitChain/Info;
-`x/consensuskeys` registry module; genesis tooling (forkpoint + valset data
-from app genesis); `decided_last_commit` populated from parent-QC signer
-bitmap. Milestone: 1-node, then 4-node in-process testnet producing finalized
-EVM blocks over MonadBFT.
+**A4 — ABCI bridge + evmd** ✅ *milestone reached*
+Nested `bridge/` module (core stays dep-free; evmd via local `replace`).
+ABCI-backed swarm executors: `Ledger` (FinalizeBlock+Commit per finalized
+block, `DecidedLastCommit` from parent-QC signer bitmap → VoteInfo in valset
+order), `TxPool` (ReapTxs + PrepareProposal for block building; CheckTx +
+InsertTx for submission), `ValSet` (ValidatorUpdates → EvUpdateValidators at
+epoch boundaries), `StateRead` (committed-height app-hash index for
+delayed-execution results). Genesis tooling in `evmdapp.go` (deterministic
+valset keys, slashing signing infos, bonded-pool top-up for N validators).
+Key adaptation: PrepareProposal runs at app height (committed tip + 1), not
+consensus seq — CometBFT's mempool assumes sequential heights; MonadBFT
+pipelines ~2 seqs ahead. ProcessProposal is not in the hot path (Rust's
+check_coherency doesn't re-execute; pipelined proposals outrun the finalized
+tip anyway) — `MockBlockPolicy` does the structural checks.
+Verified: `TestBridgeOneNode` + `TestBridgeFourNodes` — 4 in-process evmd
+apps reach height 12 with byte-identical app hashes (`-tags=test`).
+Remaining: `x/consensuskeys` registry module on the cosmos-evm side (binds
+app cons keys ↔ MonadBFT node/cert keys for on-chain valset exchange).
 
 **A5 — Loopback/TCP interop transport (test-only)**
 Minimal transport satisfying `RouterCommand` so Track-A E2E runs before Track B
