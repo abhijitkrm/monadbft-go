@@ -338,7 +338,7 @@ func (w *Wrapper) pickPeer() *types.NodeId {
 		}
 	}
 	if len(members) == 0 {
-		panic("blocksync: no nodes to blocksync from")
+		return nil // solo node — no peers to blocksync from
 	}
 	p := w.chooseWeighted(valSet, members)
 	return &p
