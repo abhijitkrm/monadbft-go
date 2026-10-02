@@ -3,13 +3,12 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/cockroachdb/pebble"
-
 	"github.com/abhijitkrm/monadbft-go/cstypes"
 	"github.com/abhijitkrm/monadbft-go/exec"
 	"github.com/abhijitkrm/monadbft-go/rlp"
 	"github.com/abhijitkrm/monadbft-go/types"
+	"github.com/cockroachdb/pebble"
+	"sync"
 )
 
 // Key spaces:
@@ -27,11 +26,22 @@ var (
 
 var syncWrite = &pebble.WriteOptions{Sync: true}
 
+// ErrClosed — sentinel for ops racing Close (see BlockStore's doc).
+var ErrClosed = pebble.ErrClosed
+
 // BlockStore — the consensus block store: durable headers+bodies (+QC via
 // headers) backing blocksync service and ledger reconstruction on restart.
+//
+// Ops take mu in read mode so Close never runs under an in-flight batch:
+// pebble panics on use-after-close, and the engine's commit worker can
+// outlive the node loop that owns Close. Post-close ops get ErrClosed —
+// callers log and drop, which is the correct tail-commit semantics on
+// shutdown (app state is already committed).
 type BlockStore struct {
-	db *pebble.DB
-	ep *exec.Protocol
+	db     *pebble.DB
+	ep     *exec.Protocol
+	mu     sync.RWMutex
+	closed bool
 }
 
 func OpenBlockStore(dir string, ep *exec.Protocol) (*BlockStore, error) {
@@ -42,7 +52,15 @@ func OpenBlockStore(dir string, ep *exec.Protocol) (*BlockStore, error) {
 	return &BlockStore{db: db, ep: ep}, nil
 }
 
-func (s *BlockStore) Close() error { return s.db.Close() }
+func (s *BlockStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.db.Close()
+}
 
 func blkKey(id types.BlockId) []byte {
 	k := make([]byte, 4+32)
@@ -74,6 +92,11 @@ func pldKey(id cstypes.ConsensusBlockBodyId) []byte {
 
 // PutBlock — persist a full block with seq and payload indexes. Idempotent.
 func (s *BlockStore) PutBlock(b *cstypes.ConsensusFullBlock) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
 	id := b.GetId()
 	batch := s.db.NewBatch()
 	defer batch.Close()
@@ -91,10 +114,20 @@ func (s *BlockStore) PutBlock(b *cstypes.ConsensusFullBlock) error {
 
 // PutFinalized — mark a block as committed (ledger-finalized).
 func (s *BlockStore) PutFinalized(seq types.SeqNum, id types.BlockId) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
 	return s.db.Set(finKey(seq), id[:], syncWrite)
 }
 
 func (s *BlockStore) get(key []byte) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
 	v, closer, err := s.db.Get(key)
 	if err != nil {
 		return nil, err
@@ -114,13 +147,25 @@ func prefixUpperBound(prefix []byte) []byte {
 
 // GetBlock — fetch a full block by id; nil if absent.
 func (s *BlockStore) GetBlock(id types.BlockId) (*cstypes.ConsensusFullBlock, error) {
-	v, err := s.get(blkKey(id))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.getBlock(id)
+}
+
+// getBlock — GetBlock with mu already held (callers hold RLock through an
+// iterator loop; nested RLock can deadlock against a pending writer).
+func (s *BlockStore) getBlock(id types.BlockId) (*cstypes.ConsensusFullBlock, error) {
+	v, closer, err := s.db.Get(blkKey(id))
 	if err == pebble.ErrNotFound {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	defer closer.Close()
 	var b cstypes.ConsensusFullBlock
 	if err := b.DecodeRLP(rlp.NewStream(v), s.ep); err != nil {
 		return nil, err
@@ -162,6 +207,11 @@ func (s *BlockStore) GetPayload(pid cstypes.ConsensusBlockBodyId) (*cstypes.Cons
 
 // AllBlocks — every persisted block (for ledger rebuild on restart).
 func (s *BlockStore) AllBlocks() ([]*cstypes.ConsensusFullBlock, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
 	it, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: blkPrefix,
 		UpperBound: prefixUpperBound(blkPrefix),
@@ -183,6 +233,11 @@ func (s *BlockStore) AllBlocks() ([]*cstypes.ConsensusFullBlock, error) {
 
 // FinalizedBlocks — committed (seq, block) pairs in seq order.
 func (s *BlockStore) FinalizedBlocks() ([]*cstypes.ConsensusFullBlock, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
 	it, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: finPrefix,
 		UpperBound: prefixUpperBound(finPrefix),
@@ -195,7 +250,7 @@ func (s *BlockStore) FinalizedBlocks() ([]*cstypes.ConsensusFullBlock, error) {
 	for it.First(); it.Valid(); it.Next() {
 		var id types.BlockId
 		copy(id[:], it.Value())
-		b, err := s.GetBlock(id)
+		b, err := s.getBlock(id)
 		if err != nil {
 			return nil, err
 		}

@@ -212,6 +212,9 @@ func (l *Ledger) reconcileStoreTip(cp *cstypes.Checkpoint) {
 		l.committed[h.SeqNum] = b
 		l.app.fillValSetGap(seq)
 		if err := l.bs.PutFinalized(h.SeqNum, h.GetId()); err != nil {
+			if errors.Is(err, store.ErrClosed) {
+				return
+			}
 			panic(fmt.Sprintf("bridge: persist reconciled finalized %d: %v", seq, err))
 		}
 	}
@@ -233,6 +236,9 @@ func (l *Ledger) persistBlock(b *cstypes.ConsensusFullBlock) {
 	}
 	id := b.GetId()
 	if err := l.bs.PutBlock(b); err != nil {
+		if errors.Is(err, store.ErrClosed) {
+			return // store closed mid-shutdown; index self-heals on reopen
+		}
 		panic(fmt.Sprintf("bridge: persist block %x seq %d: %v",
 			id[:8], b.GetSeqNum(), err))
 	}
@@ -496,6 +502,9 @@ func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []by
 	}
 	if l.bs != nil {
 		if err := l.bs.PutFinalized(h.SeqNum, h.GetId()); err != nil {
+			if errors.Is(err, store.ErrClosed) {
+				return // shutdown raced the commit worker; app already committed
+			}
 			panic(fmt.Sprintf("bridge: persist finalized %d: %v", h.SeqNum, err))
 		}
 	}
