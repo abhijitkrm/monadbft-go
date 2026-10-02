@@ -65,56 +65,68 @@ func NewNodes(apps []*App, vals []Validator, cfg Config) (swarm.SwarmBuilder, er
 
 	builders := make(swarm.SwarmBuilder, len(apps))
 	for i, app := range apps {
-		spec := NewSpecApp(app)
-		ledger := NewLedger(app, spec)
-		valset, err := NewValSet(app, cfg.EpochLength)
+		b, err := NewNodeBuilder(i, app, vals[i], allPeers, lockedEpochValidators, cfg)
 		if err != nil {
 			return nil, err
 		}
-		v := vals[i]
-		builders[i] = swarm.NodeBuilder{
-			ID: swarm.NewID(v.NodeId()),
-			StateBuilder: &monadstate.Builder{
-				LeaderElection: validator.WeightedRoundRobin{},
-				BlockValidator: blocktree.MockValidator{},
-				BlockPolicy: blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
-					swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment),
-				StateRead: NewStateRead(app, spec),
-				Forkpoint: forkpoint,
-
-				LockedEpochValidators: lockedEpochValidators,
-
-				Keypair:     v.Secp,
-				CertKeypair: v.Bls,
-
-				BlocksyncRngSeed: uint64Ptr(123456),
-
-				ConsensusConfig: &consensusstate.Config{
-					ExecutionDelay: cfg.ExecutionDelay,
-					Delta:          cfg.Delta,
-					ChainConfig:    cfg.ChainConfig,
-
-					StatesyncToLiveThreshold:   cfg.StatesyncThreshold,
-					LiveToStatesyncThreshold:   types.SeqNum(cfg.StatesyncThreshold.Uint64() * 3 / 2),
-					StartExecutionThreshold:    types.SeqNum(cfg.StatesyncThreshold.Uint64() / 2),
-					TimestampLatencyEstimateNs: types.U128FromUint64(10_000_000),
-				},
-
-				StatesyncExpandToGroup: true,
-				ServeStatesync:         true,
-			},
-			RouterScheduler:   swarm.NewBytesRouterScheduler(allPeers, Evm),
-			ValSetUpdater:     valset,
-			TxPoolExecutor:    NewTxPool(app),
-			Ledger:            ledger,
-			StateSyncExecutor: NewStateSync(app, ledger, spec),
-			OutboundPipeline:  swarm.TransformerPipeline{swarm.NewLatencyTransformer(cfg.Delta)},
-			InboundPipeline:   swarm.TransformerPipeline{},
-			TimestamperConfig: swarm.DefaultTimestamperConfig(),
-			Seed:              swarm.DefaultSeed(i),
-		}
+		b.StateBuilder.Forkpoint = forkpoint
+		builders[i] = *b
 	}
 	return builders, nil
+}
+
+// NewNodeBuilder — the per-node construction used by NewNodes, exported so
+// tests can rebuild a single node mid-run (e.g. a wiped validator that
+// must statesync to rejoin). The caller sets StateBuilder.Forkpoint to the
+// boot point (ForkpointGenesis() for a fresh network, or a live peer's
+// forkpoint for a rejoining node).
+func NewNodeBuilder(i int, app *App, v Validator, allPeers []types.NodeId, lockedEpochValidators []glue.ValidatorSetDataWithEpoch, cfg Config) (*swarm.NodeBuilder, error) {
+	spec := NewSpecApp(app)
+	ledger := NewLedger(app, spec)
+	valset, err := NewValSet(app, cfg.EpochLength)
+	if err != nil {
+		return nil, err
+	}
+	return &swarm.NodeBuilder{
+		ID: swarm.NewID(v.NodeId()),
+		StateBuilder: &monadstate.Builder{
+			LeaderElection: validator.WeightedRoundRobin{},
+			BlockValidator: blocktree.MockValidator{},
+			BlockPolicy: blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
+				swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment),
+			StateRead: NewStateRead(app, spec),
+
+			LockedEpochValidators: lockedEpochValidators,
+
+			Keypair:     v.Secp,
+			CertKeypair: v.Bls,
+
+			BlocksyncRngSeed: uint64Ptr(123456),
+
+			ConsensusConfig: &consensusstate.Config{
+				ExecutionDelay: cfg.ExecutionDelay,
+				Delta:          cfg.Delta,
+				ChainConfig:    cfg.ChainConfig,
+
+				StatesyncToLiveThreshold:   cfg.StatesyncThreshold,
+				LiveToStatesyncThreshold:   types.SeqNum(cfg.StatesyncThreshold.Uint64() * 3 / 2),
+				StartExecutionThreshold:    types.SeqNum(cfg.StatesyncThreshold.Uint64() / 2),
+				TimestampLatencyEstimateNs: types.U128FromUint64(10_000_000),
+			},
+
+			StatesyncExpandToGroup: true,
+			ServeStatesync:         true,
+		},
+		RouterScheduler:   swarm.NewBytesRouterScheduler(allPeers, Evm),
+		ValSetUpdater:     valset,
+		TxPoolExecutor:    NewTxPool(app),
+		Ledger:            ledger,
+		StateSyncExecutor: NewStateSync(app, ledger, spec),
+		OutboundPipeline:  swarm.TransformerPipeline{swarm.NewLatencyTransformer(cfg.Delta)},
+		InboundPipeline:   swarm.TransformerPipeline{},
+		TimestamperConfig: swarm.DefaultTimestamperConfig(),
+		Seed:              swarm.DefaultSeed(i),
+	}, nil
 }
 
 func uint64Ptr(v uint64) *uint64 { return &v }
