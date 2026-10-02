@@ -412,7 +412,7 @@ func reverse(b []byte) []byte {
 // verifyBlockHeaders — Rust verify_block_headers: range length + tip id +
 // parent linkage.
 func verifyBlockHeaders(blockRange cstypes.BlockRange, headers []cstypes.ConsensusBlockHeader) bool {
-	if len(headers) != int(blockRange.NumBlocks) {
+	if len(headers) == 0 || len(headers) > int(blockRange.NumBlocks) {
 		return false
 	}
 	if blockRange.LastBlockId != headers[len(headers)-1].GetId() {
@@ -422,6 +422,11 @@ func verifyBlockHeaders(blockRange cstypes.BlockRange, headers []cstypes.Consens
 		if headers[i].GetId() != headers[i+1].GetParentId() {
 			return false
 		}
+	}
+	// A shortfall is only valid when the chain terminates at genesis —
+	// the oldest returned header's parent must be the sentinel id.
+	if len(headers) != int(blockRange.NumBlocks) {
+		return headers[0].GetParentId() == types.GENESIS_BLOCK_ID
 	}
 	return true
 }

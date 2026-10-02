@@ -149,12 +149,18 @@ func (l *Ledger) getHeaders(blockRange cstypes.BlockRange) blocksync.ResponseMes
 	nextID := blockRange.LastBlockId
 	var headers []cstypes.ConsensusBlockHeader
 	for uint64(len(headers)) < blockRange.NumBlocks.Uint64() {
+		if nextID == types.GENESIS_BLOCK_ID {
+			break // chain terminus — no stored genesis block
+		}
 		block, ok := l.blocks[nextID]
 		if !ok {
 			return blocksync.ResponseHeadersNotAvailable(blockRange)
 		}
 		headers = append([]cstypes.ConsensusBlockHeader{block.Header}, headers...)
 		nextID = block.Header.GetParentId()
+	}
+	if len(headers) == 0 {
+		return blocksync.ResponseHeadersNotAvailable(blockRange)
 	}
 	return blocksync.ResponseHeaders(blockRange, headers)
 }

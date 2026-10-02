@@ -199,10 +199,21 @@ func (b *BlockBuffer) NeedsBlocksync() *cstypes.BlockRange {
 		return &cstypes.BlockRange{LastBlockId: b.root, NumBlocks: b.minNumBlocks}
 	}
 	last := chain[len(chain)-1]
+	// Chain terminates at genesis — no earlier full block exists to fetch.
+	if last.GetSeqNum() <= types.SeqNum(1) {
+		return nil
+	}
 	if uint64(len(chain)) < uint64(b.minNumBlocks) {
+		// Clamp so the range can't dip below seq 1 — genesis (seq 0) is a
+		// sentinel id with no stored block; verifyBlockHeaders accepts the
+		// resulting genesis-terminated shortfall.
+		want := b.minNumBlocks - types.SeqNum(len(chain))
+		if avail := last.GetSeqNum() - 1; want > avail {
+			want = avail
+		}
 		return &cstypes.BlockRange{
 			LastBlockId: last.GetParentId(),
-			NumBlocks:   b.minNumBlocks - types.SeqNum(len(chain)),
+			NumBlocks:   want,
 		}
 	}
 	return nil
