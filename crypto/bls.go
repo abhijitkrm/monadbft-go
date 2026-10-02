@@ -94,6 +94,10 @@ func (p BlsPubKey) String() string { return fmt.Sprintf("%x", p.Compress()) }
 type BlsKeyPair struct {
 	sk *blst.SecretKey
 	pk BlsPubKey
+	// ikm — the input keying material the pair was derived from. Persisted
+	// by the node key file; LoadOrGenMonadKey reloads via FromBytes, so the
+	// accessor round-trips only for FromBytes-constructed pairs.
+	ikm []byte
 }
 
 // BlsKeyPairFromBytes: ikm -> key_gen(ikm, key_info=[]). Rust: from_bytes
@@ -105,7 +109,7 @@ func BlsKeyPairFromBytes(ikm []byte) (*BlsKeyPair, error) {
 	if sk == nil {
 		return nil, errors.New("bls: keygen failed")
 	}
-	return &BlsKeyPair{sk: sk, pk: BlsPubKey{inner: new(blst.P1Affine).From(sk)}}, nil
+	return &BlsKeyPair{sk: sk, pk: BlsPubKey{inner: new(blst.P1Affine).From(sk)}, ikm: append([]byte(nil), ikm...)}, nil
 }
 
 // BlsKeyPairFromIkm: key_gen(ikm, key_info="monad-bls-keygen"). Rust: from_ikm
@@ -121,6 +125,10 @@ func BlsKeyPairFromIkm(ikm []byte) (*BlsKeyPair, error) {
 }
 
 func (k *BlsKeyPair) PubKey() BlsPubKey { return k.pk }
+
+// IKM — the input keying material (see the struct field note). Nil when the
+// pair was derived via FromIkm with different key_info.
+func (k *BlsKeyPair) IKM() []byte { return append([]byte(nil), k.ikm...) }
 
 // Sign signs (domain || msg). Rust: BlsKeyPair::sign<SD>
 func (k *BlsKeyPair) Sign(domain, msg []byte) BlsSignature {

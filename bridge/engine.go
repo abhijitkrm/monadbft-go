@@ -254,7 +254,7 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	}
 	statesyncExec := NewStateSync(bapp, ledger, spec)
 
-	transport, err := buildTransport(cfg, selfID, secp, vsd, dataDir)
+	transport, err := buildTransport(cfg, selfID, secp, vsd, root, dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +417,7 @@ func initChainRequest(genDoc *cmttypes.GenesisDoc) (*abcitypes.RequestInitChain,
 // buildTransport — the networking half of the engine: tcp | raptorcast |
 // none (single-node devnet).
 func buildTransport(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPair,
-	vsd glue.ValidatorSetData, dataDir string) (node.Transport, error) {
+	vsd glue.ValidatorSetData, root, dataDir string) (node.Transport, error) {
 	switch cfg.Transport {
 	case "", "none":
 		// Single-node devnet: no sockets, but consensus still needs its own
@@ -435,9 +435,22 @@ func buildTransport(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPair
 			return nil, fmt.Errorf("tcp_address: %w", err)
 		}
 		_ = portStr
+		// Static peering reuses the bootstrap peers file — each signed name
+		// record's TCP socket is the dial target (self is filtered inside
+		// BootstrapRecords).
+		peers := map[types.NodeId]string{}
+		if cfg.PeersFile != "" {
+			recs, err := node.LoadBootstrapPeersFile(resolvePath(root, cfg.PeersFile))
+			if err != nil {
+				return nil, fmt.Errorf("tcp peers_file: %w", err)
+			}
+			for id, nr := range node.BootstrapRecords(recs, self) {
+				peers[id] = nr.TCPSocket().String()
+			}
+		}
 		return node.NewTCPTransport(self, node.TCPConfig{
 			Listen: cfg.TCPAddress,
-			Peers:  map[types.NodeId]string{},
+			Peers:  peers,
 		}), nil
 	case "raptorcast":
 		return buildRaptorcast(cfg, self, key, vsd, dataDir)
