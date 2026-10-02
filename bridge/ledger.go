@@ -229,27 +229,80 @@ func (l *Ledger) finalizeOne(block *cstypes.ConsensusFullBlock) {
 		}
 	}
 	if appHash == nil {
-		l.app.opMu.Lock()
-		res, err := l.app.FinalizeBlock(context.Background(), l.finalizeRequest(h, body.Txs))
-		if err != nil {
-			panic(fmt.Sprintf("bridge: FinalizeBlock h=%d: %v", seq, err))
-		}
-		if err := l.app.Commit(context.Background()); err != nil {
-			panic(fmt.Sprintf("bridge: Commit h=%d: %v", seq, err))
-		}
-		l.app.opMu.Unlock()
-		appHash, updates = res.AppHash, res.ValidatorUpdates
+		appHash, updates = l.finalizeDirect(block, body)
 	}
+	l.recordCommitted(block, appHash, updates)
+}
 
-	l.app.recordCommit(seq, resultEntry{
+// finalizeDirect — synchronous FinalizeBlock+Commit for one block (opMu
+// serializes the store-touching pair against the spec worker).
+func (l *Ledger) finalizeDirect(block *cstypes.ConsensusFullBlock, body *EvmBody) ([]byte, []abcitypes.ValidatorUpdate) {
+	h := block.Header
+	seq := int64(h.SeqNum.Uint64())
+	l.app.opMu.Lock()
+	defer l.app.opMu.Unlock()
+	res, err := l.app.FinalizeBlock(context.Background(), l.finalizeRequest(h, body.Txs))
+	if err != nil {
+		panic(fmt.Sprintf("bridge: FinalizeBlock h=%d: %v", seq, err))
+	}
+	if err := l.app.Commit(context.Background()); err != nil {
+		panic(fmt.Sprintf("bridge: Commit h=%d: %v", seq, err))
+	}
+	return res.AppHash, res.ValidatorUpdates
+}
+
+// recordCommitted — canonical bookkeeping after a block commits.
+func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []byte, updates []abcitypes.ValidatorUpdate) {
+	h := block.Header
+	body := block.Body.Inner.ExecutionBody.(*EvmBody)
+	l.app.recordCommit(int64(h.SeqNum.Uint64()), resultEntry{
 		header:  &EvmFinalizedHeader{Number: h.SeqNum, AppHash: appHash},
-		blockID: blockID,
+		blockID: h.GetId(),
 		txs:     body.Txs,
 	})
 	l.committed[h.SeqNum] = block
 	if err := l.app.applyUpdates(updates); err != nil {
 		panic(err)
 	}
+}
+
+// applySyncedBlock — replay one statesync-served block through the direct
+// commit path. Spec consultation is deliberately skipped: during a sync the
+// spec index holds the stale pre-sync lineage, and treating the canonical
+// replay as an "orphan" would roll back the just-synced store. The spec
+// frontier is re-anchored wholesale via SpecApp.ResetToHeight at DoneSync.
+func (l *Ledger) applySyncedBlock(block *cstypes.ConsensusFullBlock) {
+	seq := int64(block.GetSeqNum().Uint64())
+	if seq <= l.app.committedHeight() {
+		return
+	}
+	l.blocks[block.GetId()] = block
+	body, ok := block.Body.Inner.ExecutionBody.(*EvmBody)
+	if !ok {
+		panic(fmt.Sprintf("bridge: synced block seq %d unexpected body %T",
+			seq, block.Body.Inner.ExecutionBody))
+	}
+	if height := l.app.committedHeight(); seq != height+1 {
+		panic(fmt.Sprintf("bridge: synced block seq %d at height %d — gaps", seq, height))
+	}
+	appHash, updates := l.finalizeDirect(block, body)
+	l.recordCommitted(block, appHash, updates)
+}
+
+// committedBlock — canonical finalized block at seq (statesync serving).
+func (l *Ledger) committedBlock(seq types.SeqNum) *cstypes.ConsensusFullBlock {
+	return l.committed[seq]
+}
+
+// committedSeq — highest committed seq (statesync service window).
+func (l *Ledger) committedSeq() types.SeqNum {
+	var max types.SeqNum
+	for seq := range l.committed {
+		if seq > max {
+			max = seq
+		}
+	}
+	return max
 }
 
 // committedID — the canonical block ID at a committed seq (genesis → zero ID).

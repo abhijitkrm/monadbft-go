@@ -122,6 +122,7 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 		}
 		spec := bridge.NewAsyncSpecApp(app)
 		t.Cleanup(spec.Close)
+		ledger := bridge.NewLedger(app, spec)
 		var transport node.Transport
 		switch transportKind {
 		case "tcp":
@@ -159,10 +160,10 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 			ServeStatesync:         true,
 			GenesisValidators:      genesisVals,
 			Executors: node.Executors{
-				Ledger:    bridge.NewLedger(app, spec),
+				Ledger:    ledger,
 				TxPool:    newPoolBridge(app, &pools[i]),
 				ValSet:    valset,
-				StateSync: bridge.NopStateSync{},
+				StateSync: bridge.NewStateSync(app, ledger, spec),
 				Transport: transport,
 			},
 		})

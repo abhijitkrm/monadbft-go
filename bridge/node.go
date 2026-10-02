@@ -66,6 +66,7 @@ func NewNodes(apps []*App, vals []Validator, cfg Config) (swarm.SwarmBuilder, er
 	builders := make(swarm.SwarmBuilder, len(apps))
 	for i, app := range apps {
 		spec := NewSpecApp(app)
+		ledger := NewLedger(app, spec)
 		valset, err := NewValSet(app, cfg.EpochLength)
 		if err != nil {
 			return nil, err
@@ -105,8 +106,8 @@ func NewNodes(apps []*App, vals []Validator, cfg Config) (swarm.SwarmBuilder, er
 			RouterScheduler:   swarm.NewBytesRouterScheduler(allPeers, Evm),
 			ValSetUpdater:     valset,
 			TxPoolExecutor:    NewTxPool(app),
-			Ledger:            NewLedger(app, spec),
-			StateSyncExecutor: NopStateSync{},
+			Ledger:            ledger,
+			StateSyncExecutor: NewStateSync(app, ledger, spec),
 			OutboundPipeline:  swarm.TransformerPipeline{swarm.NewLatencyTransformer(cfg.Delta)},
 			InboundPipeline:   swarm.TransformerPipeline{},
 			TimestamperConfig: swarm.DefaultTimestamperConfig(),

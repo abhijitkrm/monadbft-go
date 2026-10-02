@@ -167,6 +167,12 @@ func (s *SpecApp) runSpec(ctx context.Context, req *abcitypes.RequestFinalizeBlo
 	if parentID != s.tipID {
 		return nil, fmt.Errorf("%w (parent %x vs tip %x)", ErrSpecNotChaining, parentID[:4], s.tipID[:4])
 	}
+	// Revalidate against the live store tip: statesync replay advances the
+	// canonical store behind the spec index's back, and a stale queued job
+	// must not double-commit an old height.
+	if storeTip := s.raw.LastBlockHeight(); req.Height != storeTip+1 {
+		return nil, fmt.Errorf("%w (height %d after store tip %d)", ErrSpecNotChaining, req.Height, storeTip)
+	}
 	res, err := s.app.FinalizeBlock(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: spec FinalizeBlock h=%d: %w", req.Height, err)
@@ -302,4 +308,33 @@ func (s *SpecApp) rewindLocked(h int64, tipID types.BlockId) error {
 	s.tip = h
 	s.tipID = tipID
 	return nil
+}
+
+// ResetToHeight — re-anchor the spec frontier at a synced canonical tip.
+// Statesync replay replaces the store with a canonical lineage that bears
+// no relation to the pre-sync speculative branch: every spec entry is stale
+// (keeping them would make CommittedResult treat canonical commits as
+// orphans and roll back synced state). The caller supplies the canonical
+// block ID at h so the next SpecFinalize chains correctly.
+func (s *SpecApp) ResetToHeight(h int64, tipID types.BlockId) {
+	// Drain queued jobs first — they were submitted against the stale
+	// lineage and must not observe the reset tip.
+	if s.jobs != nil {
+	drain:
+		for {
+			select {
+			case <-s.jobs:
+			default:
+				break drain
+			}
+		}
+	}
+	s.app.opMu.Lock()
+	defer s.app.opMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bySeq = map[int64]specEntry{}
+	s.byID = map[types.BlockId]int64{}
+	s.tip = h
+	s.tipID = tipID
 }
