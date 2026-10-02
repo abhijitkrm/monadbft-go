@@ -54,9 +54,22 @@ func AppendUint8(dst []byte, v uint8) []byte {
 	return AppendUint64(dst, uint64(v))
 }
 
+// AppendUint16 encodes a u16.
+func AppendUint16(dst []byte, v uint16) []byte {
+	return AppendUint64(dst, uint64(v))
+}
+
 // AppendUint32 encodes a u32.
 func AppendUint32(dst []byte, v uint32) []byte {
 	return AppendUint64(dst, uint64(v))
+}
+
+// AppendBool encodes a bool as alloy-rlp does (0x01 / empty string).
+func AppendBool(dst []byte, v bool) []byte {
+	if v {
+		return AppendUint64(dst, 1)
+	}
+	return AppendUint64(dst, 0)
 }
 
 // AppendUint128 encodes a u128.
@@ -247,6 +260,54 @@ func (s *Stream) Uint64() (uint64, error) {
 		return 0, err
 	}
 	return leftPadUint64(b)
+}
+
+// Uint8 decodes a u8 (value must fit in one byte).
+func (s *Stream) Uint8() (uint8, error) {
+	v, err := s.Uint64()
+	if err != nil {
+		return 0, err
+	}
+	if v > 0xff {
+		return 0, ErrOverflow
+	}
+	return uint8(v), nil
+}
+
+// Uint16 decodes a u16.
+func (s *Stream) Uint16() (uint16, error) {
+	v, err := s.Uint64()
+	if err != nil {
+		return 0, err
+	}
+	if v > 0xffff {
+		return 0, ErrOverflow
+	}
+	return uint16(v), nil
+}
+
+// Uint32 decodes a u32.
+func (s *Stream) Uint32() (uint32, error) {
+	v, err := s.Uint64()
+	if err != nil {
+		return 0, err
+	}
+	if v > 0xffffffff {
+		return 0, ErrOverflow
+	}
+	return uint32(v), nil
+}
+
+// Bool decodes a bool — alloy-rlp accepts only 0 or 1.
+func (s *Stream) Bool() (bool, error) {
+	v, err := s.Uint8()
+	if err != nil {
+		return false, err
+	}
+	if v > 1 {
+		return false, ErrCustom
+	}
+	return v == 1, nil
 }
 
 func leftPadUint64(b []byte) (uint64, error) {
