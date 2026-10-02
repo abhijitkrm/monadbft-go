@@ -417,3 +417,38 @@ func TestBridgeStatesyncRejoin(t *testing.T) {
 		t.Logf("rejoin: node %d height=%d", i, a.Height())
 	}
 }
+
+// TestBridgeEpochBoundary — a short epoch length forces the consensus
+// epoch machinery to roll (valset lock boundaries at epochLength) while
+// the bridge keeps finalizing. Asserts committed-height/apptash parity
+// across nodes past several epoch transitions.
+func TestBridgeEpochBoundary(t *testing.T) {
+	vals := bridge.MakeValidators(4)
+	cfg := bridge.DefaultConfig()
+	cfg.EpochLength = 6 // boundary every 6 seqs; lock window inside it
+
+	apps := make([]*bridge.App, 4)
+	for i := range apps {
+		evmtypes.NewEVMConfigurator().ResetTestConfig()
+		app, _, err := bridge.NewEvmdApp(bridge.EvmdConfig{
+			ChainID:    "monadbft-bridge-test",
+			EVMChainID: testEvmChainID,
+			Home:       t.TempDir(),
+		}, vals)
+		if err != nil {
+			t.Fatalf("NewEvmdApp node %d: %v", i, err)
+		}
+		apps[i] = app
+	}
+	builders, err := bridge.NewNodes(apps, vals, cfg)
+	if err != nil {
+		t.Fatalf("NewNodes: %v", err)
+	}
+	nodes := builders.Build()
+	ids := nodes.SortedKeys()
+	runUntil(t, nodes, ids, 20) // well past the epoch-2 boundary at 6
+	assertSameChain(t, apps, 18)
+	for i, a := range apps {
+		t.Logf("epoch-boundary node %d height=%d", i, a.Height())
+	}
+}
