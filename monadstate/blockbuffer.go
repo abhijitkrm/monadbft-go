@@ -51,6 +51,15 @@ func (b *BlockBuffer) PayloadCache() map[cstypes.ConsensusBlockBodyId]*cstypes.C
 	return b.payloadCache
 }
 
+// RootHeader — the buffered root block's header; nil until blocksync lands it.
+func (b *BlockBuffer) RootHeader() *cstypes.ConsensusBlockHeader {
+	fb, ok := b.fullBlocks[b.root]
+	if !ok {
+		return nil
+	}
+	return &fb.Header
+}
+
 func (b *BlockBuffer) RootSeqNum() (types.SeqNum, bool) {
 	ri := b.RootInfo()
 	if ri == nil {

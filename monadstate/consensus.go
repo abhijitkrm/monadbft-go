@@ -39,6 +39,20 @@ func (m *MonadState) updateConsensus(ev glue.ConsensusEvent) []wrappedConsensusC
 								command: consensusstate.CmdRequestStateSync{Root: *newRoot, HighQC: *newHighQC},
 							})
 						}
+					} else if m.restoredSafety != nil &&
+						m.consensus.highCertificate.Round()+1 < m.restoredSafety.Snapshot().HighestVote {
+						// Watermark hold (wiped/crashed node that voted ahead
+						// of its forkpoint): re-anchor the high certificate
+						// on the proposal's certified parent so the go-live
+						// gate clears once observed certs pass the watermark.
+						// Root stays put — ReRoot to the same root is a no-op.
+						qc := pm.Proposal.Tip.BlockHeader.QC
+						if hdr := m.consensus.blockBuffer.RootHeader(); hdr != nil &&
+							qc.GetRound() > m.consensus.highCertificate.Round() {
+							cmds = append(cmds, wrappedConsensusCommand{
+								command: consensusstate.CmdRequestStateSync{Root: *hdr, HighQC: qc},
+							})
+						}
 					}
 				}
 			}

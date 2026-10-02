@@ -18,10 +18,14 @@ import (
 
 // File names mirror Rust: forkpoint.rlp holds the latest checkpoint;
 // validators.rlp holds the trailing validator sets (Rust writes toml — ours
-// are RLP, the "equivalent" per PLAN).
+// are RLP, the "equivalent" per PLAN). statesync-target.rlp is the Go
+// port's addition: the pending statesync forkpoint written when the live
+// consensus hits the maybe_statesync panic (Rust's "restart client and
+// statesync" — here the restart is supervised in-process).
 const (
-	forkpointFile  = "forkpoint.rlp"
-	validatorsFile = "validators.rlp"
+	forkpointFile       = "forkpoint.rlp"
+	validatorsFile      = "validators.rlp"
+	statesyncTargetFile = "statesync-target.rlp"
 )
 
 // writeAtomic — Rust write_checkpoint_bytes_to_path: write a named backup
@@ -212,6 +216,41 @@ func LoadCheckpoint(dir string, ep *exec.Protocol) (*cstypes.Checkpoint, error) 
 		return nil, err
 	}
 	return &cp, nil
+}
+
+// WriteStatesyncTarget — persist the pending statesync forkpoint
+// (checkpoint-shaped: Root is the high-qc-certified block id,
+// HighCertificate the qc). Written by the panic-recovery path before the
+// node exits; consumed by the next boot, which re-roots the block buffer
+// at the target and drives Sync-mode statesync instead of going live at
+// the stale root.
+func WriteStatesyncTarget(dir string, cp cstypes.Checkpoint) error {
+	return writeAtomic(dir, statesyncTargetFile, "", cp.EncodeRLP(nil))
+}
+
+// LoadStatesyncTarget — read the pending statesync forkpoint, nil if absent.
+func LoadStatesyncTarget(dir string, ep *exec.Protocol) (*cstypes.Checkpoint, error) {
+	data, err := os.ReadFile(filepath.Join(dir, statesyncTargetFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var cp cstypes.Checkpoint
+	if err := cp.DecodeRLP(rlp.NewStream(data), ep); err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
+// ClearStatesyncTarget — drop a consumed/stale statesync forkpoint.
+func ClearStatesyncTarget(dir string) error {
+	err := os.Remove(filepath.Join(dir, statesyncTargetFile))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // LoadValidatorSets — read the persisted trailing validator sets.

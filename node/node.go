@@ -8,6 +8,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/abhijitkrm/monadbft-go/consensus"
 	"github.com/abhijitkrm/monadbft-go/consensusstate"
 	"github.com/abhijitkrm/monadbft-go/crypto"
+	"github.com/abhijitkrm/monadbft-go/cstypes"
 	"github.com/abhijitkrm/monadbft-go/exec"
 	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/metrics"
@@ -111,7 +113,20 @@ type Node struct {
 // Open builds a node: opens persistence, constructs MonadState from the
 // persisted forkpoint (or genesis), replays the WAL, and executes the
 // resulting init commands. The node is not running until Start.
-func Open(cfg Config) (*Node, error) {
+//
+// Consensus invariant violations during Build/replay panic in Rust — here
+// they surface as errors so a supervisor (engine restart loop) can handle a
+// bad persisted state without taking the whole process down.
+func Open(cfg Config) (n *Node, err error) {
+	var persist *Persistence
+	defer func() {
+		if r := recover(); r != nil {
+			if persist != nil {
+				persist.Close()
+			}
+			err = fmt.Errorf("node: init panic: %v", r)
+		}
+	}()
 	if cfg.Dir == "" {
 		return nil, fmt.Errorf("node: Dir required")
 	}
@@ -131,7 +146,7 @@ func Open(cfg Config) (*Node, error) {
 		cfg.Timestamper = DefaultTimestamperConfig()
 	}
 
-	persist := cfg.Persistence
+	persist = cfg.Persistence
 	if persist == nil {
 		var err error
 		persist, err = OpenPersistence(cfg.Dir, cfg.Protocol, cfg.SyncWAL, !cfg.DisableWAL)
@@ -140,7 +155,7 @@ func Open(cfg Config) (*Node, error) {
 		}
 	}
 
-	n := &Node{
+	n = &Node{
 		cfg:        cfg,
 		log:        cfg.Logger,
 		exec:       cfg.Executors,
@@ -198,7 +213,77 @@ func Open(cfg Config) (*Node, error) {
 			return nil, err
 		}
 	}
+
+	// A pending statesync target supersedes the persisted checkpoint root:
+	// the previous run's live→statesync panic recorded the observed tip so
+	// this boot re-roots the block buffer there and drives Sync-mode
+	// statesync, rather than going live far behind and panicking again.
+	tgt, err := store.LoadStatesyncTarget(cfg.Dir, cfg.Protocol)
+	if err != nil {
+		persist.Close()
+		return nil, err
+	}
+	if tgt != nil && persist.Blocks != nil {
+		stale := false
+		if cp != nil {
+			if cur := blockSeq(persist.Blocks, cp.Root); cur != nil {
+				if tb := blockSeq(persist.Blocks, tgt.Root); tb != nil && *cur >= *tb {
+					stale = true // forkpoint already advanced past the target
+				}
+			}
+		}
+		tgtBlock, _ := persist.Blocks.GetBlock(tgt.Root)
+		if stale || tgtBlock == nil {
+			_ = store.ClearStatesyncTarget(cfg.Dir)
+			tgt = nil
+		}
+	}
+	if tgt != nil {
+		if cp == nil {
+			// Wiped dir: no persisted locked epochs — cover the target with
+			// the genesis validator set (single-epoch chains; a wiped node
+			// at a later epoch must restore from snapshot instead).
+			cp = &cstypes.Checkpoint{
+				ValidatorSets: monadstate.ForkpointGenesis().Checkpoint.ValidatorSets,
+			}
+		}
+		maxLocked := types.Epoch(0)
+		for _, le := range cp.ValidatorSets {
+			if le.Epoch > maxLocked {
+				maxLocked = le.Epoch
+			}
+		}
+		if tb, _ := persist.Blocks.GetBlock(tgt.Root); tb != nil && tb.GetEpoch() > maxLocked {
+			persist.Close()
+			return nil, fmt.Errorf("node: statesync target epoch %d exceeds forkpoint "+
+				"validator coverage %d — restore from snapshot", tb.GetEpoch().Uint64(), maxLocked.Uint64())
+		}
+		cp.Root = tgt.Root
+		cp.HighCertificate = tgt.HighCertificate
+		if persist.Blocks != nil {
+			if cp, err = sanitizeCheckpoint(cp, persist.Blocks, cfg.Logger); err != nil {
+				persist.Close()
+				return nil, fmt.Errorf("node: statesync target checkpoint: %w", err)
+			}
+		}
+		n.log.Warn("statesync target pending — re-rooting forkpoint",
+			"root", fmt.Sprintf("%x", cp.Root[:8]), "hc_round", cp.HighCertificate.Round().Uint64())
+	}
 	if cp != nil {
+		if locked == nil {
+			// Wiped dir + synthesized checkpoint: map the locked epochs onto
+			// the genesis validator set.
+			if len(cfg.GenesisValidators.Validators) == 0 {
+				persist.Close()
+				return nil, fmt.Errorf("node: statesync restart requires GenesisValidators")
+			}
+			for _, le := range cp.ValidatorSets {
+				locked = append(locked, glue.ValidatorSetDataWithEpoch{
+					Epoch:      le.Epoch,
+					Validators: cfg.GenesisValidators,
+				})
+			}
+		}
 		forkpoint = monadstate.Forkpoint{Checkpoint: *cp}
 		lockedEpochs = locked
 		n.log.Info("resuming from persisted forkpoint",
@@ -352,12 +437,33 @@ func (n *Node) loop() {
 	}
 }
 
+// ErrNeedStatesync — the node's fatal error when live consensus detects the
+// high QC has run past LiveToStatesyncThreshold from the blocktree root.
+// Before exiting, the node persists the observed target to
+// statesync-target.rlp so a supervisor restart re-roots the forkpoint there
+// and drives Sync-mode statesync — the in-process equivalent of Rust's
+// "restart client and statesync" operator action.
+var ErrNeedStatesync = errors.New("node: high qc too far ahead — statesync required")
+
 // handle — one event through the machine. A panic in MonadState or an
 // executor is fatal: the node stops (a half-alive consensus participant is
 // worse than a dead one — Rust aborts the process on consensus panics too).
+// The one recoverable panic is NeedStatesync: the certified target is
+// persisted and the node exits with ErrNeedStatesync for the supervisor.
 func (n *Node) handle(ev glue.MonadEvent) {
 	defer func() {
 		if r := recover(); r != nil {
+			if ns, ok := r.(consensusstate.NeedStatesync); ok {
+				n.log.Warn("high qc too far ahead — persisting statesync target",
+					"target_seq", ns.Root.GetSeqNum().Uint64(),
+					"qc_round", ns.HighQC.GetRound().Uint64())
+				n.persistStatesyncTarget(ns)
+				n.mu.Lock()
+				n.fatal = ErrNeedStatesync
+				n.mu.Unlock()
+				go n.Stop()
+				return
+			}
 			n.log.Error("consensus panic — shutting down", "event", fmt.Sprintf("%T", ev), "panic", r,
 				"stack", string(debug.Stack()))
 			n.mu.Lock()
@@ -407,6 +513,26 @@ func (n *Node) persistSafety() {
 
 // handleInbound — transport callback: decode wire bytes into a MonadEvent
 // and enqueue. Malformed traffic is dropped, never fatal.
+// persistStatesyncTarget — write the next boot's forkpoint target: the
+// high-qc-certified block plus a checkpoint pinned at it. The block goes to
+// the blockstore so the restart's sanitizeCheckpoint finds the root; the
+// checkpoint goes to statesync-target.rlp so Open re-roots the block buffer
+// at the observed tip instead of the stale persisted root.
+func (n *Node) persistStatesyncTarget(ns consensusstate.NeedStatesync) {
+	if n.persist.Blocks != nil {
+		if err := n.persist.Blocks.PutBlock(ns.Root); err != nil {
+			n.log.Error("statesync target: root block persist failed", "err", err)
+		}
+	}
+	tgt := cstypes.Checkpoint{
+		Root:            ns.Root.GetId(),
+		HighCertificate: *cstypes.RoundCertFromQC(ns.HighQC),
+	}
+	if err := store.WriteStatesyncTarget(n.cfg.Dir, tgt); err != nil {
+		n.log.Error("statesync target: write failed", "err", err)
+	}
+}
+
 func (n *Node) handleInbound(from types.NodeId, payload []byte) {
 	msg, err := glue.DecodeMonadMessage(payload, n.cfg.Protocol)
 	if err != nil {
@@ -442,6 +568,21 @@ func (n *Node) Peers() []glue.PeerEntry {
 		return t.Peers()
 	}
 	return nil
+}
+
+// blockSeq — seqnum lookup for a checkpoint root id; nil if the block
+// (or genesis id) is not in the store.
+func blockSeq(bs *store.BlockStore, id types.BlockId) *types.SeqNum {
+	if id == types.GENESIS_BLOCK_ID {
+		z := types.GENESIS_SEQ_NUM
+		return &z
+	}
+	b, err := bs.GetBlock(id)
+	if err != nil || b == nil {
+		return nil
+	}
+	s := b.GetSeqNum()
+	return &s
 }
 
 func wallNow() time.Time { return time.Now().UTC() }

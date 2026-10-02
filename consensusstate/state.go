@@ -1,6 +1,7 @@
 package consensusstate
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/abhijitkrm/monadbft-go/blocktree"
@@ -987,6 +988,25 @@ func (s *State) updateProposedHead() []Command {
 	}}}
 }
 
+// NeedStatesync — panic payload for the live→statesync transition. Rust
+// maybe_statesync aborts the process and relies on the operator to restart
+// with statesync; the Go port makes the panic recoverable: the supervisor
+// persists Root+HighQC as the next boot's forkpoint target, then restarts
+// into ConsensusMode::Sync, which blocksyncs the ancestry and drives the
+// statesync executor before going live.
+type NeedStatesync struct {
+	// Root is the block certified by HighQC — the restart's forkpoint root.
+	Root *cstypes.ConsensusFullBlock
+	// HighQC is the high certificate observed over the far-ahead tip.
+	HighQC cstypes.QuorumCertificate
+}
+
+func (e NeedStatesync) Error() string {
+	return fmt.Sprintf("consensusstate: high qc too far ahead of block tree root, "+
+		"restart client and statesync (certified_seq=%d qc_round=%d)",
+		e.Root.GetSeqNum().Uint64(), e.HighQC.GetRound().Uint64())
+}
+
 // maybeStatesync — Rust maybe_statesync: panic if the high QC is too far
 // ahead of the blocktree root (operator must restart + statesync).
 func (s *State) maybeStatesync() []Command {
@@ -998,7 +1018,11 @@ func (s *State) maybeStatesync() []Command {
 	if s.Consensus.PendingBlockTree.Root().SeqNum+s.Config.LiveToStatesyncThreshold > highQcSeqNum {
 		return nil
 	}
-	panic("consensusstate: high qc too far ahead of block tree root, restart client and statesync")
+	root := s.Consensus.PendingBlockTree.GetBlock(highQc.GetBlockId())
+	if root == nil {
+		panic("consensusstate: high qc certified block missing from pending tree")
+	}
+	panic(NeedStatesync{Root: root, HighQC: highQc})
 }
 
 // tryVote — Rust try_vote: timestamp + coherence + safety checks, then

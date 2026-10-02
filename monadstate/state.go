@@ -614,7 +614,18 @@ func (m *MonadState) maybeStartConsensus() []glue.Command {
 		return nil
 	}
 
-	// dbStatus == Done: bring the node live.
+	// dbStatus == Done: bring the node live — but hold in Sync mode while
+	// the restored safety watermarks sit ahead of the pacemaker's start
+	// round (highest_vote > high_certificate.round+1). Going live below the
+	// watermark panics on the first local timeout (safety.timeout requires
+	// round >= highest_vote). This is the wipe-with-surviving-safety case:
+	// the chain moved on without this node, so it stays in Sync mode until
+	// observed certs advance the high certificate past the watermark.
+	if m.restoredSafety != nil &&
+		m.consensus.highCertificate.Round()+1 < m.restoredSafety.Snapshot().HighestVote {
+		return nil
+	}
+
 	var cmds []glue.Command
 
 	// the last 2*delay committed blocks (oldest-first), policy-validated.
