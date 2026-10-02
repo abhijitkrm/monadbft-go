@@ -6,31 +6,44 @@ import (
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
-// StateRead — blocktree.ExecutionStateRead over the app's committed results.
+// StateRead — blocktree.ExecutionStateRead over the app's results.
 //
-// Synchronous execution means a block only has an execution result once it
-// is finalized; proposed-but-unfinalized blocks return ErrNotAvailableYet
-// (the upstream proposals-fallback would need speculative execution, which
-// the bridge defers).
+// Finalized lookups serve the canonical committed-result index (seq +
+// blockID verified). Non-finalized lookups serve the speculative index —
+// blocks executed by SpecApp ahead of finalization — which is what lets
+// execution_delay>0 proposals embed delayed_execution_results. A nil spec
+// index degrades to the old synchronous behavior (ErrNotAvailableYet for
+// unfinalized blocks).
 type StateRead struct {
-	app *App
+	app  *App
+	spec *SpecApp
 }
 
 var _ blocktree.ExecutionStateRead = (*StateRead)(nil)
 
-func NewStateRead(app *App) *StateRead { return &StateRead{app: app} }
+func NewStateRead(app *App, spec *SpecApp) *StateRead {
+	return &StateRead{app: app, spec: spec}
+}
 
-// GetExecutionResult — the finalized result for (blockID, seqNum).
+// GetExecutionResult — the result for (blockID, seqNum): committed index
+// when isFinalized, speculative index otherwise.
 func (s *StateRead) GetExecutionResult(
 	blockID types.BlockId, seqNum types.SeqNum, isFinalized bool,
 ) (exec.FinalizedHeader, error) {
+	if !isFinalized {
+		if s.spec == nil {
+			return nil, blocktree.ErrNotAvailableYet
+		}
+		seq, appHash, _, ok := s.spec.SpecResultID(blockID)
+		if !ok || seq != int64(seqNum.Uint64()) {
+			return nil, blocktree.ErrNotAvailableYet
+		}
+		return &EvmFinalizedHeader{Number: seqNum, AppHash: appHash}, nil
+	}
 	s.app.mu.Lock()
 	entry, ok := s.app.results[int64(seqNum.Uint64())]
 	s.app.mu.Unlock()
-	if !ok {
-		return nil, blocktree.ErrNotAvailableYet
-	}
-	if isFinalized && entry.blockID != blockID {
+	if !ok || entry.blockID != blockID {
 		return nil, blocktree.ErrNotAvailableYet
 	}
 	return entry.header, nil

@@ -182,6 +182,50 @@ func (p *MockBlockPolicy) CheckCoherency(
 	return nil
 }
 
+// EvmBlockPolicy — the production block policy for Cosmos-EVM chains:
+// MockBlockPolicy's seq/timestamp/delayed-result checks plus the upstream
+// base-fee triple assertion (EthBlockPolicy::check_coherency). The expected
+// triple is constructor-wired — upstream derives it from chain params +
+// extending-chain trend accumulators (compute_base_fee); Cosmos-EVM's
+// feemarket is the fee authority, so for the NoBaseFee devnet the constants
+// are the whole story. Per-tx signer/nonce/balance/gas checks remain
+// upstream-only: they need extending-branch account state, which the ABCI
+// seam doesn't expose (documented in PLAN.md).
+type EvmBlockPolicy struct {
+	MockBlockPolicy
+	BaseFee       uint64
+	BaseFeeTrend  uint64
+	BaseFeeMoment uint64
+}
+
+func NewEvmBlockPolicy(executionDelay types.SeqNum, baseFee, baseFeeTrend, baseFeeMoment uint64) *EvmBlockPolicy {
+	return &EvmBlockPolicy{
+		MockBlockPolicy: *NewMockBlockPolicy(executionDelay),
+		BaseFee:         baseFee,
+		BaseFeeTrend:    baseFeeTrend,
+		BaseFeeMoment:   baseFeeMoment,
+	}
+}
+
+func (p *EvmBlockPolicy) CheckCoherency(
+	block *cstypes.ConsensusFullBlock,
+	extending []*cstypes.ConsensusFullBlock,
+	root RootInfo,
+	stateRead ExecutionStateRead,
+	cfg chaincfg.Config,
+) error {
+	if err := p.MockBlockPolicy.CheckCoherency(block, extending, root, stateRead, cfg); err != nil {
+		return err
+	}
+	// verify base_fee fields (upstream compute_base_fee check)
+	if block.Header.BaseFee != p.BaseFee ||
+		block.Header.BaseFeeTrend != p.BaseFeeTrend ||
+		block.Header.BaseFeeMoment != p.BaseFeeMoment {
+		return ErrBaseFee
+	}
+	return nil
+}
+
 // GetExpectedExecutionResults — Rust EthBlockPolicy::get_expected_execution_
 // results: the execution result for block_seq_num - execution_delay, resolved
 // via the extending branch first then the committed index.

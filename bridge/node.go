@@ -65,6 +65,7 @@ func NewNodes(apps []*App, vals []Validator, cfg Config) (swarm.SwarmBuilder, er
 
 	builders := make(swarm.SwarmBuilder, len(apps))
 	for i, app := range apps {
+		spec := NewSpecApp(app)
 		valset, err := NewValSet(app, cfg.EpochLength)
 		if err != nil {
 			return nil, err
@@ -75,9 +76,10 @@ func NewNodes(apps []*App, vals []Validator, cfg Config) (swarm.SwarmBuilder, er
 			StateBuilder: &monadstate.Builder{
 				LeaderElection: validator.WeightedRoundRobin{},
 				BlockValidator: blocktree.MockValidator{},
-				BlockPolicy:    blocktree.NewMockBlockPolicy(cfg.ExecutionDelay),
-				StateRead:      NewStateRead(app),
-				Forkpoint:      forkpoint,
+				BlockPolicy: blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
+					swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment),
+				StateRead: NewStateRead(app, spec),
+				Forkpoint: forkpoint,
 
 				LockedEpochValidators: lockedEpochValidators,
 
@@ -103,7 +105,7 @@ func NewNodes(apps []*App, vals []Validator, cfg Config) (swarm.SwarmBuilder, er
 			RouterScheduler:   swarm.NewBytesRouterScheduler(allPeers, Evm),
 			ValSetUpdater:     valset,
 			TxPoolExecutor:    NewTxPool(app),
-			Ledger:            NewLedger(app),
+			Ledger:            NewLedger(app, spec),
 			StateSyncExecutor: NopStateSync{},
 			OutboundPipeline:  swarm.TransformerPipeline{swarm.NewLatencyTransformer(cfg.Delta)},
 			InboundPipeline:   swarm.TransformerPipeline{},

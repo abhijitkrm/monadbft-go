@@ -13,6 +13,7 @@ import (
 	cryptoenc "github.com/cometbft/cometbft/crypto/encoding"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	cmttypes "github.com/cometbft/cometbft/types"
+	"github.com/cosmos/evm/evmd"
 
 	"github.com/abhijitkrm/monadbft-go/crypto"
 	"github.com/abhijitkrm/monadbft-go/cstypes"
@@ -83,6 +84,7 @@ func CmtValidatorSet(vals []Validator) *cmttypes.ValidatorSet {
 //   - per-height finalized execution results (app hash index)
 type App struct {
 	app abcitypes.Application
+	raw *evmd.EVMD // concrete app when built via NewEvmdApp (nil otherwise)
 
 	monadVals []Validator            // sorted by NodeId — QC bit order
 	appSet    *cmttypes.ValidatorSet // canonical order for VoteInfo
@@ -94,6 +96,13 @@ type App struct {
 	mu      sync.Mutex
 	height  int64                 // last committed height
 	results map[int64]resultEntry // committed height → execution result
+
+	// opMu serializes store-touching ABCI calls. With SpecApp's async
+	// worker, FinalizeBlock+Commit run off the node loop while
+	// CheckTx/PrepareProposal still run on it — the SDK's single cms +
+	// mode slots aren't safe for concurrent use, so every app-level call
+	// pairs holds this mutex.
+	opMu sync.Mutex
 }
 
 type resultEntry struct {
@@ -181,6 +190,27 @@ func (a *App) FinalizeBlock(ctx context.Context, req *abcitypes.RequestFinalizeB
 func (a *App) Commit(ctx context.Context) error {
 	_, err := a.app.Commit(ctx, &abcitypes.RequestCommit{})
 	return err
+}
+
+// Raw — the concrete evmd app when built via NewEvmdApp (nil for other
+// ABCI apps). SpecApp needs it for CommitMultiStore rollback.
+func (a *App) Raw() *evmd.EVMD { return a.raw }
+
+// LockOps/UnlockOps — serialize store-touching ABCI calls across
+// goroutines (spec worker vs node loop). Callers batch related calls
+// (ReapTxs+PrepareProposal, CheckTx+InsertTx) under one hold.
+func (a *App) LockOps()   { a.opMu.Lock() }
+func (a *App) UnlockOps() { a.opMu.Unlock() }
+
+// StoreTip — the last committed store height (a.height tracks the
+// canonicalized tip; the store itself runs ahead when SpecApp has
+// committed speculative heights — those are still "latest committed
+// state" for mempool validation purposes).
+func (a *App) StoreTip() int64 {
+	if a.raw != nil {
+		return a.raw.LastBlockHeight()
+	}
+	return a.committedHeight()
 }
 
 // Height — last committed height.

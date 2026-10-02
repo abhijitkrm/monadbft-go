@@ -23,6 +23,7 @@ import (
 	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/net/peerdisc"
 	"github.com/abhijitkrm/monadbft-go/node"
+	"github.com/abhijitkrm/monadbft-go/swarm"
 	"github.com/abhijitkrm/monadbft-go/types"
 
 	"github.com/cosmos/evm/evmd"
@@ -119,6 +120,8 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 		if err != nil {
 			t.Fatalf("NewValSet node %d: %v", i, err)
 		}
+		spec := bridge.NewAsyncSpecApp(app)
+		t.Cleanup(spec.Close)
 		var transport node.Transport
 		switch transportKind {
 		case "tcp":
@@ -148,14 +151,15 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 				StartExecutionThreshold:    types.SeqNum(cfg.StatesyncThreshold.Uint64() / 2),
 				TimestampLatencyEstimateNs: types.U128FromUint64(10_000_000),
 			},
-			BlockValidator:         blocktree.MockValidator{},
-			BlockPolicy:            blocktree.NewMockBlockPolicy(cfg.ExecutionDelay),
-			StateRead:              bridge.NewStateRead(app),
+			BlockValidator: blocktree.MockValidator{},
+			BlockPolicy: blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
+				swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment),
+			StateRead:              bridge.NewStateRead(app, spec),
 			StatesyncExpandToGroup: true,
 			ServeStatesync:         true,
 			GenesisValidators:      genesisVals,
 			Executors: node.Executors{
-				Ledger:    bridge.NewLedger(app),
+				Ledger:    bridge.NewLedger(app, spec),
 				TxPool:    newPoolBridge(app, &pools[i]),
 				ValSet:    valset,
 				StateSync: bridge.NopStateSync{},

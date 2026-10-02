@@ -7,129 +7,299 @@ import (
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/cosmos/evm/evmd"
+
+	"github.com/abhijitkrm/monadbft-go/types"
 )
 
-// SpecApp — a shadow evmd instance that executes FinalizeBlock for
-// consensus-blocks whose commitment hasn't landed yet. This is the bridge's
-// implementation of MonadBFT's deferred-execution primitive: with
-// execution_delay>0 a proposal at seq N embeds the execution results of seq
-// N-delay, so results must be computed before the canonical FinalizeBlock
-// runs them.
+// SpecApp — speculative-execution bookkeeping over the canonical App: the
+// block pipeline (FinalizeBlock+Commit) runs on the real app at
+// proposal/QC-commit time — ahead of the ledger's 2-chain finalization — so
+// `execution_delay>0` proposals can embed delayed_execution_results and the
+// canonical commit path reuses the already-computed result instead of
+// re-executing (the WS-4b "commit the pre-computed branch" shape).
 //
-// Rather than branching app.cms in place (SDK BaseApp couples execModeFinalize
-// to a single slot + unexported internals — the seam PORTING-PLAN WS-4b calls
-// out as requiring an SDK patch), SpecApp is a second app instance over its
-// own in-memory store. The FinalizeBlock request is fully determined by the
-// consensus block (txs, height, time, proposer, commit votes, hash) so the
-// shadow produces byte-identical results; on an orphaned branch the shadow
-// rewinds via LoadVersion and re-executes the winning lineage.
+// This design executes speculatively on the app's own store rather than a
+// shadow instance or an SDK-internal branch: BaseApp's execModeFinalize seam
+// can't host caller-chosen parents without an SDK patch, while the store's
+// commit history is identical either way (proven byte-for-byte by the
+// shadow-app variant in specapp_test).
 //
-// All methods are serialized on an internal mutex; the node loop calls into
-// it only from the executor seam.
+//   - app.height / app.results stay ledger-canonical (only finalization
+//     records them); the spec index is separate.
+//   - CheckTx/ReapTxs/PrepareProposal run against the speculative tip —
+//     mempool accounting actually improves (txs consumed by in-flight
+//     blocks are no longer re-accepted).
+//   - Orphaned spec lineages rewind the app store via
+//     rootmulti.RollbackToVersion — never below the ledger's finalized
+//     height (finalized heights are QC-safe by consensus).
+//
+// All methods are serialized on an internal mutex; the node loop drives it
+// through the ledger executor seam.
 type SpecApp struct {
-	*App
-	raw  *evmd.EVMD
-	cfg  EvmdConfig
-	vals []Validator
+	app *App
+	raw *evmd.EVMD // for CommitMultiStore().RollbackToVersion
 
-	mu      sync.Mutex
-	tip     int64            // shadow's committed height (== last spec seq)
-	lastID  [32]byte         // block ID of the spec tip (orphan detection)
-	results map[int64][]byte // height → AppHash of the spec-executed block
+	mu    sync.Mutex
+	tip   int64         // store's spec-executed height (≥ app.finalized height)
+	tipID types.BlockId // block ID at the spec tip (lineage for orphans)
+	bySeq map[int64]specEntry
+	byID  map[types.BlockId]int64
+
+	// async worker (NewAsyncSpecApp): SpecFinalize submits run off the
+	// caller's goroutine — FinalizeBlock is expensive enough to starve a
+	// consensus loop. Nil jobs channel = synchronous mode.
+	jobs chan specJob
+	stop chan struct{}
+	wg   sync.WaitGroup
 }
 
-// NewSpecApp — shadow instance sharing cfg/vals; InitChain'd identically so
-// genesis state (and thus all heights' execution) matches the canonical app.
-func NewSpecApp(cfg EvmdConfig, vals []Validator) (*SpecApp, error) {
-	app, raw, err := NewEvmdApp(cfg, vals)
-	if err != nil {
-		return nil, err
+type specJob struct {
+	req      *abcitypes.RequestFinalizeBlock
+	blockID  types.BlockId
+	parentID types.BlockId
+}
+
+// specEntry — one speculatively-executed block's durable outputs.
+type specEntry struct {
+	appHash []byte
+	updates []abcitypes.ValidatorUpdate
+	blockID types.BlockId
+}
+
+// NewSpecApp wraps an initialized app (InitChain'd, height 0 committed) in
+// synchronous mode — SpecFinalize runs inline (the deterministic-swarm
+// path). Returns nil when the app's raw isn't *evmd.EVMD — the rollback
+// seam needs CommitMultiStore, so non-evmd apps run finalize-only.
+func NewSpecApp(app *App) *SpecApp {
+	return newSpecApp(app, false)
+}
+
+// NewAsyncSpecApp — SpecApp with a worker goroutine: SpecFinalize enqueues
+// and returns immediately; results land in the spec index as the worker
+// drains (FIFO — jobs recheck chaining at execution, so a gap skips that
+// job but later jobs re-evaluate fresh).
+func NewAsyncSpecApp(app *App) *SpecApp {
+	s := newSpecApp(app, true)
+	if s == nil {
+		return nil
+	}
+	s.jobs = make(chan specJob, 256)
+	s.stop = make(chan struct{})
+	s.wg.Add(1)
+	go s.loop()
+	return s
+}
+
+func newSpecApp(app *App, _ bool) *SpecApp {
+	raw := app.Raw()
+	if raw == nil {
+		return nil
 	}
 	return &SpecApp{
-		App:     app,
-		raw:     raw,
-		cfg:     cfg,
-		vals:    vals,
-		results: map[int64][]byte{},
-	}, nil
+		app:   app,
+		raw:   raw,
+		bySeq: map[int64]specEntry{},
+		byID:  map[types.BlockId]int64{},
+	}
 }
 
-// SpecFinalize — execute req on the shadow at its current tip; the request
-// must be the same FinalizeBlock request the canonical path will build for
-// this consensus block. Returns the resulting AppHash.
-//
-// If req.Height doesn't chain onto the shadow tip the caller must Rewind
-// first — SpecFinalize errors rather than guessing.
-func (s *SpecApp) SpecFinalize(ctx context.Context, req *abcitypes.RequestFinalizeBlock) ([]byte, error) {
+// Close — stop the async worker (drains pending jobs first, since they're
+// ordered). No-op in sync mode.
+func (s *SpecApp) Close() {
+	if s.stop == nil {
+		return
+	}
+	close(s.stop)
+	s.wg.Wait()
+}
+
+func (s *SpecApp) loop() {
+	defer s.wg.Done()
+	for {
+		select {
+		case j := <-s.jobs:
+			s.runSpec(context.Background(), j.req, j.blockID, j.parentID)
+		case <-s.stop:
+			for {
+				select {
+				case j := <-s.jobs:
+					s.runSpec(context.Background(), j.req, j.blockID, j.parentID)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// ErrSpecNotChaining — submitted block does not extend the spec tip (gap or
+// fork); callers fall back to synchronous execution on finalization.
+var ErrSpecNotChaining = fmt.Errorf("bridge: block does not chain onto spec tip")
+
+// SpecFinalize — execute req on the app at the spec tip. Must chain:
+// height == tip+1 and parentID == tipID. Caller supplies the consensus block
+// IDs (req.Hash is the block's own ID as the ledger already encodes). Async
+// mode enqueues and returns nil immediately (result lands via the index).
+func (s *SpecApp) SpecFinalize(ctx context.Context, req *abcitypes.RequestFinalizeBlock, blockID, parentID types.BlockId) ([]byte, error) {
+	if s.jobs != nil {
+		select {
+		case s.jobs <- specJob{req, blockID, parentID}:
+		default:
+			// queue full — canonical finalize will execute synchronously
+		}
+		return nil, nil
+	}
+	return s.runSpec(ctx, req, blockID, parentID)
+}
+
+func (s *SpecApp) runSpec(ctx context.Context, req *abcitypes.RequestFinalizeBlock, blockID, parentID types.BlockId) ([]byte, error) {
+	// opMu serializes the store-touching call pair against the node loop's
+	// PrepareProposal/CheckTx; mu guards the spec index.
+	s.app.opMu.Lock()
+	defer s.app.opMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.Height != s.tip+1 {
-		return nil, fmt.Errorf("bridge: spec finalize height %d after tip %d", req.Height, s.tip)
+		return nil, fmt.Errorf("%w (height %d after tip %d)", ErrSpecNotChaining, req.Height, s.tip)
 	}
-	res, err := s.App.FinalizeBlock(ctx, req)
+	// tipID == GENESIS_BLOCK_ID (zero value) at the genesis tip, so the
+	// equality check covers height-1 parenting without a special case.
+	if parentID != s.tipID {
+		return nil, fmt.Errorf("%w (parent %x vs tip %x)", ErrSpecNotChaining, parentID[:4], s.tipID[:4])
+	}
+	res, err := s.app.FinalizeBlock(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: spec FinalizeBlock h=%d: %w", req.Height, err)
 	}
-	if err := s.App.Commit(ctx); err != nil {
+	if err := s.app.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("bridge: spec Commit h=%d: %w", req.Height, err)
 	}
 	s.tip = req.Height
-	copy(s.lastID[:], req.Hash)
-	s.results[req.Height] = res.AppHash
+	s.tipID = blockID
+	e := specEntry{appHash: res.AppHash, updates: res.ValidatorUpdates, blockID: blockID}
+	s.bySeq[req.Height] = e
+	s.byID[blockID] = req.Height
 	return res.AppHash, nil
 }
 
-// SpecResult — the shadow's result for height h, if executed.
-func (s *SpecApp) SpecResult(h int64) ([]byte, bool) {
+// SpecResultSeq — spec result at height h.
+func (s *SpecApp) SpecResultSeq(h int64) (appHash []byte, updates []abcitypes.ValidatorUpdate, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.results[h]
-	return r, ok
+	e, ok := s.bySeq[h]
+	return e.appHash, e.updates, ok
 }
 
-// SpecTip — shadow's committed spec height.
+// SpecResultID — spec result keyed by consensus block ID (what StateRead's
+// !isFinalized path and the ledger's commit fast-path query).
+func (s *SpecApp) SpecResultID(blockID types.BlockId) (seq int64, appHash []byte, updates []abcitypes.ValidatorUpdate, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, ok := s.byID[blockID]
+	if !ok {
+		return 0, nil, nil, false
+	}
+	e := s.bySeq[h]
+	return h, e.appHash, e.updates, true
+}
+
+// SpecTip — spec-executed height.
 func (s *SpecApp) SpecTip() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.tip
 }
 
-// Rewind — discard all spec heights above h and roll the shadow store back
-// to h (rootmulti RollbackToVersion: IAVL LoadVersionForOverwriting removes
-// versions > target). h must have been spec-executed (or 0 = genesis, which
-// rebuilds the shadow — orphan-at-height-1 is rare enough to pay the cost).
+// CommittedResult — called by the ledger as each finalized block is
+// canonicalized, in seq order. Returns the spec result when this exact
+// block was spec-executed (the common path: store already holds it).
+//
+// If the spec tip carried a different block at this seq, the branch is
+// orphaned — the store is rolled back to seq-1 (parentID supplies the
+// canonical ID there) so the caller's synchronous FinalizeBlock replays the
+// winner. Canonicalized entries ≤ seq are pruned from the spec index;
+// app.results owns them from here.
+// Lock order is always opMu → mu (the rewind path writes the store while
+// the async worker may hold opMu mid-Commit).
+func (s *SpecApp) CommittedResult(seq int64, blockID types.BlockId, parentID func(h int64) types.BlockId) ([]byte, []abcitypes.ValidatorUpdate, bool) {
+	s.app.opMu.Lock()
+	defer s.app.opMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, specd := s.bySeq[seq]
+	if specd && e.blockID == blockID {
+		// canonical winner == what we executed — prune ≤ seq, serve it.
+		for h, pr := range s.bySeq {
+			if h <= seq {
+				delete(s.byID, pr.blockID)
+				delete(s.bySeq, h)
+			}
+		}
+		return e.appHash, e.updates, true
+	}
+	if specd {
+		if err := s.rewindLocked(seq-1, parentID(seq-1)); err != nil {
+			panic(fmt.Sprintf("bridge: orphan rewind at seq %d: %v", seq, err))
+		}
+	}
+	// The caller's synchronous commit will advance the store to seq — keep
+	// the spec frontier in step so later SpecFinalize calls chain.
+	if seq > s.tip {
+		s.tip = seq
+		s.tipID = blockID
+	}
+	for h, pr := range s.bySeq {
+		if h <= seq {
+			delete(s.byID, pr.blockID)
+			delete(s.bySeq, h)
+		}
+	}
+	return nil, nil, false
+}
+
+// Rewind — discard spec heights above h and roll the store back
+// (rootmulti.RollbackToVersion removes versions > target). h=0 (orphan at
+// the first post-genesis height) is rejected: the canonical store cannot
+// rebuild — that path is statesync's job.
 func (s *SpecApp) Rewind(h int64) error {
+	s.app.opMu.Lock()
+	defer s.app.opMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if h > s.tip {
 		return fmt.Errorf("bridge: rewind target %d above tip %d", h, s.tip)
 	}
 	if h == 0 {
-		app, raw, err := NewEvmdApp(s.cfg, s.vals)
-		if err != nil {
-			return fmt.Errorf("bridge: spec rebuild: %w", err)
-		}
-		s.App, s.raw = app, raw
-		s.tip, s.results = 0, map[int64][]byte{}
-		return nil
+		return fmt.Errorf("bridge: rewind to genesis requires statesync")
 	}
-	if _, ok := s.results[h]; !ok {
+	e, ok := s.bySeq[h]
+	if !ok {
 		return fmt.Errorf("bridge: rewind target %d never spec-executed", h)
 	}
-	rms, ok := s.raw.CommitMultiStore().(interface {
+	return s.rewindLocked(h, e.blockID)
+}
+
+func (s *SpecApp) rewindLocked(h int64, tipID types.BlockId) error {
+	if h == 0 {
+		return fmt.Errorf("bridge: rewind to genesis requires statesync")
+	}
+	raw := s.app.Raw()
+	rms, ok := raw.CommitMultiStore().(interface {
 		RollbackToVersion(int64) error
 	})
 	if !ok {
-		return fmt.Errorf("bridge: shadow store %T cannot rollback", s.raw.CommitMultiStore())
+		return fmt.Errorf("bridge: store %T cannot rollback", raw.CommitMultiStore())
 	}
 	if err := rms.RollbackToVersion(h); err != nil {
-		return fmt.Errorf("bridge: spec rewind to %d: %w", h, err)
+		return err
 	}
-	for k := range s.results {
-		if k > h {
-			delete(s.results, k)
+	for seq, e := range s.bySeq {
+		if seq > h {
+			delete(s.byID, e.blockID)
+			delete(s.bySeq, seq)
 		}
 	}
 	s.tip = h
+	s.tipID = tipID
 	return nil
 }

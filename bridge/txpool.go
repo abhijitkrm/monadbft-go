@@ -61,30 +61,38 @@ func (t *TxPool) Exec(cmds []glue.TxPoolCommand) {
 func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 	ctx := context.Background()
 
+	// opMu: ReapTxs+PrepareProposal must not interleave with a spec commit.
+	t.app.opMu.Lock()
 	reap, err := t.app.app.ReapTxs(ctx, &abcitypes.RequestReapTxs{
 		MaxBytes: c.ProposalByteLimit,
 		MaxGas:   c.ProposalGasLimit,
 	})
 	if err != nil {
+		t.app.opMu.Unlock()
 		panic(fmt.Sprintf("bridge: ReapTxs r=%d seq=%d: %v", c.Round, c.SeqNum, err))
 	}
 
-	// Height is the app's next committed height (committed tip + 1), NOT the
-	// consensus seqnum: the mempool selects txs validated at the latest
-	// committed state (selectHeight = req.Height-1). MonadBFT pipelines
-	// proposals ~2 seqs ahead of finalization, so passing the seqnum would
-	// make the mempool wait on a height that can only commit via this very
-	// proposal — a deadlock. ReapNewValidTxs returns only unreaped txs, so
-	// in-flight proposals stay disjoint.
+	// Height is the store's next height (store tip + 1), NOT the consensus
+	// seqnum: the mempool selects txs validated at the latest committed
+	// state (selectHeight = req.Height-1). MonadBFT pipelines proposals ~2
+	// seqs ahead of finalization, so passing the seqnum would make the
+	// mempool wait on a height that can only commit via this very proposal
+	// — a deadlock. With speculative execution the store tip runs ahead of
+	// the canonicalized height — those heights are committed to the store,
+	// so they're the right validation context (and it keeps req.Height away
+	// from initialHeight, whose SDK path reads a finalize slot that Commit
+	// clears). ReapNewValidTxs returns only unreaped txs, so in-flight
+	// proposals stay disjoint.
 	res, err := t.app.app.PrepareProposal(ctx, &abcitypes.RequestPrepareProposal{
 		Txs:                reap.Txs,
 		MaxTxBytes:         int64(c.ProposalByteLimit),
-		Height:             t.app.height + 1,
+		Height:             t.app.StoreTip() + 1,
 		Time:               time.Unix(0, int64(c.TimestampNs.Uint64())),
 		ProposerAddress:    t.app.ConsAddr(c.NodeId),
 		LocalLastCommit:    t.app.LocalLastCommit(c.HighQC),
 		NextValidatorsHash: t.app.ValidatorsHash(),
 	})
+	t.app.opMu.Unlock()
 	if err != nil {
 		panic(fmt.Sprintf("bridge: PrepareProposal r=%d seq=%d: %v", c.Round, c.SeqNum, err))
 	}
@@ -124,20 +132,26 @@ func (t *TxPool) insertTxs(txs [][]byte) [][]byte {
 	ctx := context.Background()
 	var inserted [][]byte
 	for _, tx := range txs {
-		res, err := t.app.app.CheckTx(ctx, &abcitypes.RequestCheckTx{
-			Tx:   tx,
-			Type: abcitypes.CheckTxType_New,
-		})
+		// CheckTx+InsertTx under one opMu hold (spec commits can't
+		// interleave between validation and insertion).
+		err := func() error {
+			t.app.opMu.Lock()
+			defer t.app.opMu.Unlock()
+			res, err := t.app.app.CheckTx(ctx, &abcitypes.RequestCheckTx{
+				Tx:   tx,
+				Type: abcitypes.CheckTxType_New,
+			})
+			if err != nil {
+				return err
+			}
+			if res.Code != 0 {
+				return fmt.Errorf("CheckTx code=%d: %s", res.Code, res.Log)
+			}
+			_, err = t.app.app.InsertTx(ctx, &abcitypes.RequestInsertTx{Tx: tx})
+			return err
+		}()
 		if err != nil {
-			t.errf("CheckTx: %v", err)
-			continue
-		}
-		if res.Code != 0 {
-			t.errf("CheckTx code=%d: %s", res.Code, res.Log)
-			continue
-		}
-		if _, err := t.app.app.InsertTx(ctx, &abcitypes.RequestInsertTx{Tx: tx}); err != nil {
-			t.errf("InsertTx: %v", err)
+			t.errf("submit: %v", err)
 			continue
 		}
 		inserted = append(inserted, tx)

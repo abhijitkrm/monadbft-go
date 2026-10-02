@@ -143,6 +143,7 @@ func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
 	// NewCometABCIWrapper adapts the SDK's ctx-free ABCI methods onto
 	// cometbft's Application interface (the "local client" seam).
 	app := NewApp(server.NewCometABCIWrapper(evmApp), vals)
+	app.raw = evmApp
 	if err := app.InitChain(context.Background(), &abci.RequestInitChain{
 		Validators:      []abci.ValidatorUpdate{},
 		ConsensusParams: simtestutil.DefaultConsensusParams,

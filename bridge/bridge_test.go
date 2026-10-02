@@ -11,6 +11,7 @@ import (
 
 	"github.com/abhijitkrm/monadbft-go/bridge"
 	"github.com/abhijitkrm/monadbft-go/swarm"
+	"github.com/abhijitkrm/monadbft-go/types"
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/cosmos/evm/evmd"
@@ -24,6 +25,15 @@ const testEvmChainID = testconstants.EighteenDecimalsChainID
 // buildTestnet — n in-process evmd apps sharing one genesis, wired into the
 // deterministic swarm driver via bridge executors.
 func buildTestnet(t *testing.T, n int) ([]*bridge.App, []*evmd.EVMD, *swarm.Nodes) {
+	t.Helper()
+	return buildTestnetDelay(t, n, bridge.DefaultConfig().ExecutionDelay)
+}
+
+// buildTestnetDelay — buildTestnet with an explicit execution-delay. With
+// delay < the ~2-round finality lag, proposals can only embed
+// delayed_execution_results when the spec index serves them — so the swarm
+// stalling would mean the spec path regressed.
+func buildTestnetDelay(t *testing.T, n int, delay types.SeqNum) ([]*bridge.App, []*evmd.EVMD, *swarm.Nodes) {
 	t.Helper()
 	vals := bridge.MakeValidators(n)
 	apps := make([]*bridge.App, n)
@@ -44,7 +54,9 @@ func buildTestnet(t *testing.T, n int) ([]*bridge.App, []*evmd.EVMD, *swarm.Node
 		apps[i] = app
 		raws[i] = raw
 	}
-	builders, err := bridge.NewNodes(apps, vals, bridge.DefaultConfig())
+	cfg := bridge.DefaultConfig()
+	cfg.ExecutionDelay = delay
+	builders, err := bridge.NewNodes(apps, vals, cfg)
 	if err != nil {
 		t.Fatalf("NewNodes: %v", err)
 	}
@@ -193,4 +205,20 @@ func TestBridgeTxInclusion(t *testing.T) {
 	}
 	assertSameChain(t, apps, 10)
 	t.Logf("tx %s included; nodes at height %d", wantHash, apps[0].Height())
+}
+
+// TestBridgeDeferredExec — execution_delay=2 < finality lag (~3 rounds in
+// this swarm): most proposals' delayed_execution_results must come from the
+// speculative index (seq-delay is rarely finalized at proposal time). If
+// spec were broken the swarm would stall on RxExecutionLagging; reaching
+// height 10 proves the pipeline. (delay=1 is unsupported: seq-1 can't be
+// spec-executed — see Ledger.speculate's floor.)
+func TestBridgeDeferredExec(t *testing.T) {
+	apps, _, nodes := buildTestnetDelay(t, 4, types.SeqNum(2))
+	ids := nodes.SortedKeys()
+	runUntil(t, nodes, ids, 10)
+	assertSameChain(t, apps, 8)
+	for i, a := range apps {
+		t.Logf("deferred-exec node %d height=%d", i, a.Height())
+	}
 }
