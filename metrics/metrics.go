@@ -1,20 +1,23 @@
 // Package metrics ports monad-consensus-types::metrics — the counters and
-// gauges consensus writes to. Backed by plain integers so the core has no
-// metrics-backend dependency; an exporter can snapshot/copy these.
+// gauges consensus writes to. Atomics so a Prometheus exporter can scrape
+// off the node loop without racing consensus.
 package metrics
 
-// Counter — monotonically increasing event count.
-type Counter uint64
+import "sync/atomic"
 
-func (c *Counter) Inc()         { *c++ }
-func (c *Counter) Add(v uint64) { *c += Counter(v) }
-func (c *Counter) Get() uint64  { return uint64(*c) }
+// Counter — monotonically increasing event count. Atomic so an exporter
+// can scrape off the node loop.
+type Counter struct{ v atomic.Uint64 }
+
+func (c *Counter) Inc()         { c.v.Add(1) }
+func (c *Counter) Add(v uint64) { c.v.Add(v) }
+func (c *Counter) Get() uint64  { return c.v.Load() }
 
 // Gauge — settable value (used for percentile metrics).
-type Gauge uint64
+type Gauge struct{ v atomic.Uint64 }
 
-func (g *Gauge) Set(v uint64) { *g = Gauge(v) }
-func (g *Gauge) Get() uint64  { return uint64(*g) }
+func (g *Gauge) Set(v uint64) { g.v.Store(v) }
+func (g *Gauge) Get() uint64  { return g.v.Load() }
 
 // ConsensusEvents — Rust metrics::ConsensusEvents (the subset used by
 // consensus-state).

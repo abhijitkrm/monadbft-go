@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -30,6 +31,7 @@ import (
 	"github.com/abhijitkrm/monadbft-go/blocktree"
 	"github.com/abhijitkrm/monadbft-go/consensusstate"
 	"github.com/abhijitkrm/monadbft-go/exec"
+	"github.com/abhijitkrm/monadbft-go/metrics"
 	"github.com/abhijitkrm/monadbft-go/net/peerdisc"
 	"github.com/abhijitkrm/monadbft-go/node"
 	"github.com/abhijitkrm/monadbft-go/swarm"
@@ -56,6 +58,7 @@ func main() {
 		recordSeq     = flag.Uint64("record-seq", 1, "self name-record sequence number")
 		peersFile     = flag.String("peers-file", "", "JSON bootstrap peers file (raptorcast; upstream node.toml [[peers]])")
 		genRecord     = flag.String("genrecord", "", "write this node's signed bootstrap record to PATH and exit")
+		metricsAddr   = flag.String("metrics-addr", "", "serve Prometheus metrics on ADDR (e.g. :9090)")
 	)
 	flag.Parse()
 
@@ -174,6 +177,20 @@ func main() {
 
 	if *heightFile != "" {
 		go reportHeight(*heightFile, ledger)
+	}
+
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.PrometheusHandler(n.Metrics()))
+		go func() {
+			ln, err := net.Listen("tcp", *metricsAddr)
+			if err != nil {
+				log.Printf("metrics listen %s: %v", *metricsAddr, err)
+				return
+			}
+			log.Printf("metrics on %s/metrics", ln.Addr())
+			_ = http.Serve(ln, mux)
+		}()
 	}
 
 	sig := <-stop

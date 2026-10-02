@@ -222,7 +222,7 @@ func TestNodeRestartResumes(t *testing.T) {
 			round = cs.Consensus.Pacemaker.GetCurrentRound().Uint64()
 			epoch = cs.Consensus.Pacemaker.GetCurrentEpoch().Uint64()
 		}
-		m := n0.Metrics().BlocksyncEvents
+		m := &n0.Metrics().BlocksyncEvents
 		t.Fatalf(`restarted node stalled: finalized=%d live=%v round=%d epoch=%d statesyncing=%v
   selfReq=%d selfRespOK=%d selfRespFail=%d peerReqOK=%d peerReqFail=%d noPeers=%d timeout=%d unexpected=%d`,
 			l0.FinalizedBlocksLen(), live, round, epoch, n0.State().IsStatesyncing(),
