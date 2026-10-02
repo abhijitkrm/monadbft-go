@@ -3,6 +3,7 @@ package swarm
 import (
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/abhijitkrm/monadbft-go/blocksync"
 	"github.com/abhijitkrm/monadbft-go/cstypes"
@@ -17,6 +18,10 @@ import (
 // configurable finalization delay, serves block-sync requests out of the
 // in-memory store, and mirrors commits into a shared InMemoryState.
 type MockLedger struct {
+	// mu guards blocks/committedBlocks/events — the deterministic swarm
+	// steps single-threaded, but the node/ runtime drives Exec on its loop
+	// goroutine while tests poll the readers concurrently.
+	mu              sync.Mutex
 	blocks          map[types.BlockId]*cstypes.ConsensusFullBlock
 	committedBlocks map[types.SeqNum]*cstypes.ConsensusFullBlock
 
@@ -82,6 +87,8 @@ func (l *MockLedger) putBlock(b *cstypes.ConsensusFullBlock) {
 
 // Exec — Rust Executor::exec(LedgerCommand).
 func (l *MockLedger) Exec(cmds []glue.LedgerCommand) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, cmd := range cmds {
 		switch c := cmd.(type) {
 		case glue.LedgerCommit:
@@ -168,10 +175,16 @@ func (l *MockLedger) getPayload(payloadID cstypes.ConsensusBlockBodyId) blocksyn
 }
 
 // Ready — Rust MockableLedger::ready.
-func (l *MockLedger) Ready() bool { return len(l.events) > 0 }
+func (l *MockLedger) Ready() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.events) > 0
+}
 
 // Next — Rust Stream::next → MonadEvent::BlockSyncEvent(SelfResponse).
 func (l *MockLedger) Next() glue.MonadEvent {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if len(l.events) == 0 {
 		return nil
 	}
@@ -183,6 +196,8 @@ func (l *MockLedger) Next() glue.MonadEvent {
 // GetFinalizedBlocks — Rust get_finalized_blocks (BTreeMap → ordered slice of
 // (seq, block) pairs).
 func (l *MockLedger) GetFinalizedBlocks() []FinalizedBlock {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	out := make([]FinalizedBlock, 0, len(l.committedBlocks))
 	for seq, b := range l.committedBlocks {
 		out = append(out, FinalizedBlock{SeqNum: seq, Block: b})
@@ -192,7 +207,11 @@ func (l *MockLedger) GetFinalizedBlocks() []FinalizedBlock {
 }
 
 // FinalizedBlocksLen — number of committed blocks (BTreeMap::len()).
-func (l *MockLedger) FinalizedBlocksLen() int { return len(l.committedBlocks) }
+func (l *MockLedger) FinalizedBlocksLen() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.committedBlocks)
+}
 
 // FinalizedBlock — a (seq_num, block) entry of the finalized BTreeMap.
 type FinalizedBlock struct {
@@ -201,4 +220,8 @@ type FinalizedBlock struct {
 }
 
 // Blocks — the raw block store (test inspection).
-func (l *MockLedger) Blocks() map[types.BlockId]*cstypes.ConsensusFullBlock { return l.blocks }
+func (l *MockLedger) Blocks() map[types.BlockId]*cstypes.ConsensusFullBlock {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.blocks
+}

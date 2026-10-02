@@ -26,20 +26,45 @@ const (
 
 // writeAtomic — Rust write_checkpoint_bytes_to_path: write a named backup
 // {path}.{seq}.{round}, then write a .wip temp and rename over the target.
+// Both the payload and the directory entry are fsync'd — a write that returns
+// nil must survive power loss, matching CometBFT WriteFileAtomic (otherwise
+// safety.rlp could vanish after the vote it guards has reached the wire).
 func writeAtomic(dir, file string, backupSuffix string, data []byte) error {
 	if backupSuffix != "" {
-		if err := os.WriteFile(filepath.Join(dir, file+backupSuffix), data, 0o666); err != nil {
+		if err := writeFileSync(filepath.Join(dir, file+backupSuffix), data); err != nil {
 			return fmt.Errorf("store: write backup: %w", err)
 		}
 	}
 	tmp := filepath.Join(dir, file+".wip")
-	if err := os.WriteFile(tmp, data, 0o666); err != nil {
+	if err := writeFileSync(tmp, data); err != nil {
 		return fmt.Errorf("store: write wip: %w", err)
 	}
 	if err := os.Rename(tmp, filepath.Join(dir, file)); err != nil {
 		return fmt.Errorf("store: rename: %w", err)
 	}
+	// fsync the directory so the rename itself is durable.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
+}
+
+// writeFileSync — write + fsync + close (os.WriteFile does not fsync).
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // ConfigFile — port of monad-updaters::config_file::ConfigFile: the executor
