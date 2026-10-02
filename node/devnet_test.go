@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -20,7 +21,10 @@ import (
 //
 // Each process writes an append-only heightfile ("height=N tip=hex"), which
 // the test polls for liveness and parses for cross-process convergence.
-func TestDevnetMultiProcess(t *testing.T) {
+func TestDevnetMultiProcess(t *testing.T)           { testDevnetMultiProcess(t, "tcp") }
+func TestDevnetMultiProcessRaptorcast(t *testing.T) { testDevnetMultiProcess(t, "raptorcast") }
+
+func testDevnetMultiProcess(t *testing.T, transport string) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		goBin = filepath.Join(runtime.GOROOT(), "bin", "go")
@@ -41,9 +45,21 @@ func TestDevnetMultiProcess(t *testing.T) {
 	}
 
 	const numNodes = 4
-	// Allocate four free ports, then release them for the node processes.
+	// Allocate free ports, then release them for the node processes.
+	// raptorcast needs three sockets per node: TCP, plain UDP, wireauth UDP.
 	addrs := make([]string, numNodes)
+	udpPorts := make([]int, numNodes)
+	authPorts := make([]int, numNodes)
 	var peerEnts []string
+	allocUDP := func() int {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := c.LocalAddr().(*net.UDPAddr).Port
+		_ = c.Close()
+		return port
+	}
 	for i := 0; i < numNodes; i++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -51,6 +67,9 @@ func TestDevnetMultiProcess(t *testing.T) {
 		}
 		addrs[i] = ln.Addr().String()
 		_ = ln.Close()
+		if transport == "raptorcast" {
+			udpPorts[i], authPorts[i] = allocUDP(), allocUDP()
+		}
 	}
 	for i, a := range addrs {
 		peerEnts = append(peerEnts, fmt.Sprintf("%d@%s", i, a))
@@ -64,17 +83,69 @@ func TestDevnetMultiProcess(t *testing.T) {
 		heights[i] = filepath.Join(dirs[i], "height.log")
 	}
 
+	// raptorcast: emit each node's signed bootstrap record, then merge all
+	// into a shared peers file (upstream node.toml [[peers]] equivalent).
+	var peersFile string
+	if transport == "raptorcast" {
+		tcpPorts := make([]int, numNodes)
+		for i, a := range addrs {
+			_, ps, _ := net.SplitHostPort(a)
+			tcpPorts[i], _ = strconv.Atoi(ps)
+		}
+		var recs []json.RawMessage
+		for i := 0; i < numNodes; i++ {
+			rp := filepath.Join(dirs[i], "record.json")
+			out, err := exec.Command(bin,
+				"-index", strconv.Itoa(i), "-validators", strconv.Itoa(numNodes),
+				"-bind-ip", "127.0.0.1",
+				"-tcp-port", strconv.Itoa(tcpPorts[i]),
+				"-udp-port", strconv.Itoa(udpPorts[i]),
+				"-auth-port", strconv.Itoa(authPorts[i]),
+				"-genrecord", rp,
+			).CombinedOutput()
+			if err != nil {
+				t.Fatalf("genrecord %d: %v\n%s", i, err, out)
+			}
+			data, err := os.ReadFile(rp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recs = append(recs, data)
+		}
+		merged, err := json.Marshal(recs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peersFile = filepath.Join(t.TempDir(), "peers.json")
+		if err := os.WriteFile(peersFile, merged, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	spawn := func(i int) *exec.Cmd {
-		cmd := exec.Command(bin,
+		args := []string{
 			"-data", dirs[i],
 			"-index", strconv.Itoa(i),
 			"-validators", strconv.Itoa(numNodes),
 			"-listen", addrs[i],
-			"-peers", peers,
 			"-heightfile", heights[i],
 			"-exec-delay", "4",
 			"-delta", "25",
-		)
+			"-transport", transport,
+		}
+		if transport == "raptorcast" {
+			_, ps, _ := net.SplitHostPort(addrs[i])
+			args = append(args,
+				"-bind-ip", "127.0.0.1",
+				"-tcp-port", ps,
+				"-udp-port", strconv.Itoa(udpPorts[i]),
+				"-auth-port", strconv.Itoa(authPorts[i]),
+				"-peers-file", peersFile,
+			)
+		} else {
+			args = append(args, "-peers", peers)
+		}
+		cmd := exec.Command(bin, args...)
 		logPath := filepath.Join(dirs[i], "node.log")
 		lf, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 		if err != nil {
