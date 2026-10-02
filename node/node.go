@@ -436,6 +436,14 @@ func (n *Node) NodeID() types.NodeId          { return n.state.NodeID() }
 // consensus blocks (the bridge ledger) need the same handle the node opened.
 func (n *Node) BlockStore() *store.BlockStore { return n.persist.Blocks }
 
+// Peers — the transport's current routing snapshot (peerdisc routing_info).
+func (n *Node) Peers() []glue.PeerEntry {
+	if t := n.exec.Transport; t != nil {
+		return t.Peers()
+	}
+	return nil
+}
+
 func wallNow() time.Time { return time.Now().UTC() }
 
 func ensureDir(dir string) error { return os.MkdirAll(dir, 0o777) }

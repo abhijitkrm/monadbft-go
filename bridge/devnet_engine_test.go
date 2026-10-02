@@ -29,12 +29,14 @@ import (
 
 // devnetNode — on-disk identity + dirs for one engine-managed validator.
 type devnetNode struct {
-	root    string
-	appDir  string
-	tcpAddr string
-	eng     engine.Engine
-	me      *monadEngine
-	db      dbm.DB
+	root     string
+	appDir   string
+	tcpAddr  string
+	udpPort  int
+	authPort int
+	eng      engine.Engine
+	me       *monadEngine
+	db       dbm.DB
 }
 
 func allocTCP(t *testing.T) string {
@@ -47,9 +49,19 @@ func allocTCP(t *testing.T) string {
 	return ln.Addr().String()
 }
 
+func allocUDP(t *testing.T) int {
+	t.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port
+}
+
 // writeNodeConfig — the per-node file set the engine consumes: monad key
 // file, comet priv_validator, monadbft.json, shared validators+peers files.
-func writeNodeConfig(t *testing.T, dn *devnetNode, v Validator, vals []Validator, peers []node.BootstrapPeerConfig) {
+func writeNodeConfig(t *testing.T, dn *devnetNode, transport string, v Validator, vals []Validator, peers []node.BootstrapPeerConfig) {
 	t.Helper()
 	cfgDir := filepath.Join(dn.root, "config")
 	if err := os.MkdirAll(filepath.Join(dn.root, "data"), 0o755); err != nil {
@@ -87,9 +99,13 @@ func writeNodeConfig(t *testing.T, dn *devnetNode, v Validator, vals []Validator
 		t.Fatal(err)
 	}
 	ecfg := DefaultEngineConfig()
-	ecfg.Transport = "tcp"
+	ecfg.Transport = transport
 	ecfg.TCPAddress = dn.tcpAddr
+	ecfg.UDPPort = dn.udpPort
+	ecfg.AuthPort = dn.authPort
+	ecfg.BindIP = "127.0.0.1"
 	ecfg.PeersFile = "peers.json"
+	ecfg.PeerdiscRefreshMs = 1000
 	ecfg.ValidatorsFile = "validators.json"
 	mcfg, _ := json.Marshal(ecfg)
 	if err := os.WriteFile(filepath.Join(cfgDir, "monadbft.json"), mcfg, 0o644); err != nil {
@@ -147,6 +163,16 @@ func (dn *devnetNode) stop(t *testing.T) {
 // node 0 on the same dirs — it must catch up over blocksync and resume
 // committing, ending level with the peers.
 func TestEngineMultiNodeRestart(t *testing.T) {
+	runMultiNodeRestart(t, "tcp")
+}
+
+// TestEngineMultiNodeRestartRaptorcast — same restart matrix over the
+// production dataplane (wireauth UDP + raptorcast fanout + TCP fallback).
+func TestEngineMultiNodeRestartRaptorcast(t *testing.T) {
+	runMultiNodeRestart(t, "raptorcast")
+}
+
+func runMultiNodeRestart(t *testing.T, transport string) {
 	const n = 4
 	vals := MakeValidators(n)
 	cfg := EvmdConfig{ChainID: "probe-devnet", EVMChainID: testconstants.EighteenDecimalsChainID, Home: t.TempDir()}
@@ -180,15 +206,16 @@ func TestEngineMultiNodeRestart(t *testing.T) {
 		tcp := allocTCP(t)
 		_, portStr, _ := net.SplitHostPort(tcp)
 		port, _ := strconv.Atoi(portStr)
-		nodes[i] = &devnetNode{root: t.TempDir(), appDir: t.TempDir(), tcpAddr: tcp}
-		// TCP mode only consumes TCPSocket from the record; auth is set
-		// nonzero to satisfy the record's validation.
+		nodes[i] = &devnetNode{
+			root: t.TempDir(), appDir: t.TempDir(), tcpAddr: tcp,
+			udpPort: allocUDP(t), authPort: allocUDP(t),
+		}
 		peers = append(peers, node.SelfBootstrapPeer(vals[i].Secp,
 			netip.MustParseAddr("127.0.0.1"),
-			uint16(port), 0, uint16(port), 0, 0, 1))
+			uint16(port), uint16(nodes[i].udpPort), uint16(nodes[i].authPort), 0, 0, 1))
 	}
 	for i := range nodes {
-		writeNodeConfig(t, nodes[i], vals[i], vals, peers)
+		writeNodeConfig(t, nodes[i], transport, vals[i], vals, peers)
 	}
 
 	for i := range nodes {
@@ -200,6 +227,14 @@ func TestEngineMultiNodeRestart(t *testing.T) {
 			}
 		})
 	}
+	defer func() {
+		for i, dn := range nodes {
+			if dn.me != nil {
+				id := dn.me.node.NodeID()
+				t.Logf("node%d peers=%d id=%x…", i, len(dn.me.node.Peers()), id.PubKey[:4])
+			}
+		}
+	}()
 	for i := range nodes {
 		probeWaitHeight(t, nodes[i].me, 4, 60*time.Second)
 	}

@@ -69,6 +69,9 @@ type EngineConfig struct {
 	BaseFee     uint64 `json:"base_fee"`    // proposal base-fee stamp (wei)
 	Beneficiary string `json:"beneficiary"` // 20B hex proposer fee recipient (default: self cons addr)
 	BindIP      string `json:"bind_ip"`     // raptorcast bind address (default 0.0.0.0)
+	// PeerdiscRefreshMs — peer-discovery refresh period (bootstrap re-ping,
+	// prune, lookup churn). Default 120s (upstream devnet); devnets want ~2s.
+	PeerdiscRefreshMs int `json:"peerdisc_refresh_ms"`
 }
 
 // DefaultEngineConfig — sane single-node defaults.
@@ -453,7 +456,7 @@ func buildTransport(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPair
 			Peers:  peers,
 		}), nil
 	case "raptorcast":
-		return buildRaptorcast(cfg, self, key, vsd, dataDir)
+		return buildRaptorcast(cfg, self, key, vsd, root, dataDir)
 	default:
 		return nil, fmt.Errorf("monadbft: unknown transport %q", cfg.Transport)
 	}
@@ -462,7 +465,7 @@ func buildTransport(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPair
 // buildRaptorcast — the upstream composite: wireauth UDP + plain UDP + TCP,
 // peerdisc bootstrap from the peers file, own signed name record.
 func buildRaptorcast(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPair,
-	vsd glue.ValidatorSetData, dataDir string) (node.Transport, error) {
+	vsd glue.ValidatorSetData, root, dataDir string) (node.Transport, error) {
 	ip := netip.MustParseAddr(cfg.BindIP)
 	tcpPort := 0
 	if cfg.TCPAddress != "" {
@@ -478,14 +481,18 @@ func buildRaptorcast(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPai
 		return nil, fmt.Errorf("monadbft: raptorcast requires tcp_address, udp_port, auth_port")
 	}
 
+	// Self-record seq must exceed whatever the peers file advertised for us
+	// (peers drop stale-seq records as anti-replay). Wall-clock seconds, as
+	// upstream does when re-signing self records at boot.
 	selfRecord := peerdisc.NewMonadNameRecord(
 		peerdisc.NewNameRecordWithPorts(ip,
-			uint16(tcpPort), uint16(cfg.UDPPort), uint16(cfg.AuthPort), 0, 0, 0),
+			uint16(tcpPort), uint16(cfg.UDPPort), uint16(cfg.AuthPort), 0, 0,
+			uint64(time.Now().Unix())),
 		key)
 
 	var bootstrap map[types.NodeId]peerdisc.MonadNameRecord
 	if cfg.PeersFile != "" {
-		peers, err := node.LoadBootstrapPeersFile(cfg.PeersFile)
+		peers, err := node.LoadBootstrapPeersFile(resolvePath(root, cfg.PeersFile))
 		if err != nil {
 			return nil, err
 		}
@@ -497,6 +504,10 @@ func buildRaptorcast(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPai
 		epochVals[1][vd.NodeId] = struct{}{}
 	}
 
+	refresh := 120 * time.Second
+	if cfg.PeerdiscRefreshMs > 0 {
+		refresh = time.Duration(cfg.PeerdiscRefreshMs) * time.Millisecond
+	}
 	return node.NewRaptorcastTransport(node.RaptorcastTransportConfig{
 		SelfID:   self,
 		Key:      key,
@@ -510,7 +521,7 @@ func buildRaptorcast(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPai
 			EpochValidators: epochVals,
 			BootstrapPeers:  bootstrap,
 			// upstream devnet node.toml values
-			RefreshPeriod:                   120 * time.Second,
+			RefreshPeriod:                   refresh,
 			RequestTimeout:                  5 * time.Second,
 			UnresponsivePruneThreshold:      5,
 			LastParticipationPruneThreshold: types.Round(5000),

@@ -261,6 +261,7 @@ type PeerDiscovery struct {
 
 	EpochValidators       map[types.Epoch]map[types.NodeId]struct{}
 	InitialBootstrapPeers map[types.NodeId]struct{}
+	bootstrapRecords      map[types.NodeId]MonadNameRecord
 	PrioritizedFullNodes  map[types.NodeId]struct{}
 	PinnedFullNodes       map[types.NodeId]struct{}
 
@@ -367,8 +368,10 @@ func (b PeerDiscoveryBuilder) Build() (*PeerDiscovery, []PeerDiscoveryCommand) {
 		peerLookupLimiter:               newTokenBucket(lookupRateLimitPerSec),
 	}
 	state.InitialBootstrapPeers = map[types.NodeId]struct{}{}
-	for id := range b.BootstrapPeers {
+	state.bootstrapRecords = map[types.NodeId]MonadNameRecord{}
+	for id, nr := range b.BootstrapPeers {
 		state.InitialBootstrapPeers[id] = struct{}{}
+		state.bootstrapRecords[id] = nr
 	}
 	if state.EpochValidators == nil {
 		state.EpochValidators = map[types.Epoch]map[types.NodeId]struct{}{}
@@ -916,6 +919,23 @@ func (d *PeerDiscovery) refresh() []PeerDiscoveryCommand {
 				for _, s := range old.AllUDPSockets() {
 					delete(d.SocketToID, s)
 				}
+			}
+		}
+	}
+
+	// re-ping bootstrap peers that never connected — without this a node
+	// whose initial pings were lost (peer not yet listening) is stranded
+	// permanently once pending entries are evicted.
+	for _, id := range sortedIDSet(d.InitialBootstrapPeers) {
+		if _, ok := d.RoutingInfo[id]; ok {
+			continue
+		}
+		if _, ok := d.PendingQueue[id]; ok {
+			continue
+		}
+		if nr, ok := d.bootstrapRecords[id]; ok {
+			if c, err := d.insertPeerToPending(id, nr); err == nil {
+				cmds = append(cmds, c...)
 			}
 		}
 	}
