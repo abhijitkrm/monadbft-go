@@ -553,6 +553,27 @@ func (l *Ledger) committedBlockByID(id types.BlockId) *cstypes.ConsensusFullBloc
 	return nil
 }
 
+// certifierQC — an observed (proposed/voted/committed) child block whose
+// header QC certifies (seq, id): lets Commit serve the tip height before
+// the certifying block is itself committed. Deterministic: lowest round.
+func (l *Ledger) certifierQC(id types.BlockId) (cstypes.QuorumCertificate, types.U128, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var found bool
+	var best cstypes.QuorumCertificate
+	var ts types.U128
+	for _, b := range l.blocks {
+		qc := b.Header.QC
+		if qc.GetBlockId() != id {
+			continue
+		}
+		if !found || qc.Info.Round < best.Info.Round {
+			found, best, ts = true, qc, b.Header.TimestampNs
+		}
+	}
+	return best, ts, found
+}
+
 // committedSeq — highest committed seq (statesync service window).
 func (l *Ledger) committedSeq() types.SeqNum {
 	l.mu.RLock()

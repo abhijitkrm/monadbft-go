@@ -182,22 +182,24 @@ func (c *Client) BlockResults(ctx context.Context, height *int64) (*coretypes.Re
 	return res, nil
 }
 
-// Commit — the commit certificate for height h, reconstructed from the
-// next block's QC (the QC certifying h lives in h+1's header). A tip-height
-// request has no committed successor — return an error there, matching
-// CometBFT's "block not yet committed" behavior.
+// Commit — the commit certificate for height h, reconstructed from the QC
+// certifying h: either the committed h+1's header QC, or — at the tip, where
+// no successor is committed yet — any observed child block's header QC.
 func (c *Client) Commit(ctx context.Context, height *int64) (*coretypes.ResultCommit, error) {
 	seq := c.resolveHeight(height)
-	next := c.ledger.committedBlock(types.SeqNum(uint64(seq + 1)))
-	if next == nil {
-		return nil, fmt.Errorf("commit for height %d not available yet", seq)
-	}
 	cur := c.ledger.committedBlock(types.SeqNum(uint64(seq)))
 	if cur == nil {
 		return nil, fmt.Errorf("block not found at height %d", seq)
 	}
+	var commit *cmttypes.Commit
+	if next := c.ledger.committedBlock(types.SeqNum(uint64(seq + 1))); next != nil {
+		commit = c.app.synthCommit(next)
+	} else if qc, ts, ok := c.ledger.certifierQC(cur.GetId()); ok {
+		commit = c.app.synthCommitQC(qc, cur.GetId(), seq, ts)
+	} else {
+		return nil, fmt.Errorf("commit for height %d not available yet", seq)
+	}
 	hdr := c.app.synthHeader(cur)
-	commit := c.app.synthCommit(next)
 	return &coretypes.ResultCommit{
 		SignedHeader:    cmttypes.SignedHeader{Header: &hdr, Commit: commit},
 		CanonicalCommit: false,

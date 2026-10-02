@@ -90,12 +90,13 @@ func TestMonadEngineBoots(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, h, res.Height)
 
-	// Commit(h) is synthesized from h+1's QC — the tip's own commit only
-	// exists once the next block lands, so query h-1.
-	commitH := h - 1
-	commit, err := client.Commit(ctx, &commitH)
-	require.NoError(t, err)
-	require.Equal(t, commitH, commit.SignedHeader.Height)
+	// Commit(h) is synthesized from the QC certifying h — served from the
+	// committed successor, or (at the tip) an observed child's header QC.
+	for _, commitH := range []int64{h, h - 1} {
+		commit, err := client.Commit(ctx, &commitH)
+		require.NoError(t, err)
+		require.Equal(t, commitH, commit.SignedHeader.Height)
+	}
 
 	vs, err := client.Validators(ctx, &h, nil, nil)
 	require.NoError(t, err)

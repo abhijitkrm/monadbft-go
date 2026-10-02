@@ -10,6 +10,7 @@ import (
 	"github.com/cometbft/cometbft/version"
 
 	"github.com/abhijitkrm/monadbft-go/cstypes"
+	"github.com/abhijitkrm/monadbft-go/types"
 )
 
 // cmtconv — synthesizes CometBFT wire types from committed bridge state.
@@ -74,26 +75,31 @@ func (a *App) synthHeader(b *cstypes.ConsensusFullBlock) cmttypes.Header {
 }
 
 // synthCommit — the commit cert embedded in block b for its parent (b's QC).
-// Signer bitmap is QC-aggregated — per-validator signatures don't exist in
-// the BLS aggregate, so Commit-flagged entries carry an empty signature.
 func (a *App) synthCommit(b *cstypes.ConsensusFullBlock) *cmttypes.Commit {
 	h := b.Header
-	parentSeq := int64(h.SeqNum.Uint64()) - 1
+	return a.synthCommitQC(h.QC, h.GetParentId(),
+		int64(h.SeqNum.Uint64())-1, h.TimestampNs)
+}
+
+// synthCommitQC — the comet Commit for the block that qc certifies.
+// Signer bitmap is QC-aggregated — per-validator signatures don't exist in
+// the BLS aggregate, so Commit-flagged entries carry an empty signature.
+func (a *App) synthCommitQC(qc cstypes.QuorumCertificate, blockID types.BlockId,
+	seq int64, tsNs types.U128) *cmttypes.Commit {
 	commit := &cmttypes.Commit{
-		Height: parentSeq,
-		Round:  int32(h.QC.Info.Round.Uint64()),
+		Height: seq,
+		Round:  int32(qc.Info.Round.Uint64()),
 	}
-	parentID := h.GetParentId()
 	commit.BlockID = cmttypes.BlockID{
-		Hash:          parentID[:],
-		PartSetHeader: cmttypes.PartSetHeader{Total: 1, Hash: parentID[:]},
+		Hash:          blockID[:],
+		PartSetHeader: cmttypes.PartSetHeader{Total: 1, Hash: blockID[:]},
 	}
-	vs := a.ValSetAt(parentSeq)
+	vs := a.ValSetAt(seq)
 	if vs == nil {
 		return commit
 	}
 	commit.Signatures = make([]cmttypes.CommitSig, len(vs.Validators))
-	ts := time.Unix(0, int64(h.TimestampNs.Uint64())).UTC()
+	ts := time.Unix(0, int64(tsNs.Uint64())).UTC()
 	for i, v := range vs.Validators {
 		sig := cmttypes.CommitSig{
 			BlockIDFlag:      cmttypes.BlockIDFlagAbsent,
@@ -101,7 +107,7 @@ func (a *App) synthCommit(b *cstypes.ConsensusFullBlock) *cmttypes.Commit {
 			Timestamp:        ts,
 		}
 		if mi, ok := a.byCons[string(v.Address)]; ok &&
-			mi < h.QC.Signatures.Signers.Len() && h.QC.Signatures.Signers.Bits[mi] {
+			mi < qc.Signatures.Signers.Len() && qc.Signatures.Signers.Bits[mi] {
 			sig.BlockIDFlag = cmttypes.BlockIDFlagCommit
 		}
 		commit.Signatures[i] = sig
