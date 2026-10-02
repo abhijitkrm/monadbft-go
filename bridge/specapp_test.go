@@ -154,7 +154,7 @@ func TestSpecAppOrphanRewind(t *testing.T) {
 
 	// Canon commits heights 1-2 as spec'd (same IDs) — fast path serves them.
 	for h := int64(1); h <= 2; h++ {
-		ah, _, ok := spec.CommittedResult(h, bid(h, 0xa), func(int64) types.BlockId {
+		ah, _, _, _, ok := spec.CommittedResult(h, bid(h, 0xa), func(int64) types.BlockId {
 			if h == 1 {
 				return types.GENESIS_BLOCK_ID
 			}
@@ -172,7 +172,7 @@ func TestSpecAppOrphanRewind(t *testing.T) {
 	// CommittedResult sees the mismatch, rewinds the store to 2, returns
 	// miss — and pre-bumps the frontier to the canonical winner (the
 	// caller's sync replay is about to land it).
-	_, _, ok := spec.CommittedResult(3, bid(3, 0xb), func(int64) types.BlockId {
+	_, _, _, _, ok := spec.CommittedResult(3, bid(3, 0xb), func(int64) types.BlockId {
 		return bid(2, 0xa)
 	})
 	require.False(t, ok)
@@ -233,7 +233,7 @@ func TestSpecAppFloorOrphan(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, app.Commit(context.Background()))
-	_, _, ok := spec.CommittedResult(1, bid(1, 0), func(int64) types.BlockId {
+	_, _, _, _, ok := spec.CommittedResult(1, bid(1, 0), func(int64) types.BlockId {
 		return types.GENESIS_BLOCK_ID
 	})
 	require.False(t, ok) // never spec'd — canonical already owns it
@@ -258,7 +258,7 @@ func TestSpecAppFloorOrphan(t *testing.T) {
 	})
 
 	// Canonical winner differs — rewind to 1, miss, sync replay lands.
-	_, _, ok = spec.CommittedResult(2, bid(2, 0xb), func(int64) types.BlockId {
+	_, _, _, _, ok = spec.CommittedResult(2, bid(2, 0xb), func(int64) types.BlockId {
 		return bid(1, 0)
 	})
 	require.False(t, ok)

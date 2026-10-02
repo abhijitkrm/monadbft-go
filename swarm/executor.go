@@ -379,3 +379,4 @@ func (e *MockExecutor) StepUntil(until time.Duration) *MockExecutorEvent {
 func (e *MockExecutor) Ledger() Ledger               { return e.ledger }
 func (e *MockExecutor) ValSetUpdater() ValSetUpdater { return e.valSet }
 func (e *MockExecutor) Router() RouterScheduler      { return e.router }
+func (e *MockExecutor) TxPool() TxPool               { return e.txpool }

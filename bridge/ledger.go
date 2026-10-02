@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
@@ -26,6 +27,11 @@ import (
 type Ledger struct {
 	app  *App
 	spec *SpecApp // nil → synchronous finalize-only execution
+
+	// mu guards the block maps for external readers (RPC server runs off
+	// the node loop); Exec holds it for the whole batch — all map writes
+	// happen inside Exec.
+	mu sync.RWMutex
 
 	blocks    map[types.BlockId]*cstypes.ConsensusFullBlock // proposed+voted+finalized
 	committed map[types.SeqNum]*cstypes.ConsensusFullBlock  // finalized, in seq order
@@ -54,6 +60,8 @@ func NewLedger(app *App, spec *SpecApp) *Ledger {
 
 // Exec — LedgerCommand dispatch (mirrors MockLedger, Finalized executes).
 func (l *Ledger) Exec(cmds []glue.LedgerCommand) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, cmd := range cmds {
 		switch c := cmd.(type) {
 		case glue.LedgerCommit:
@@ -222,21 +230,23 @@ func (l *Ledger) finalizeOne(block *cstypes.ConsensusFullBlock) {
 
 	var appHash []byte
 	var updates []abcitypes.ValidatorUpdate
+	var txResults []*abcitypes.ExecTxResult
+	var events []abcitypes.Event
 	if l.spec != nil {
-		appHash, updates, ok = l.spec.CommittedResult(seq, blockID, l.committedID)
+		appHash, updates, txResults, events, ok = l.spec.CommittedResult(seq, blockID, l.committedID)
 		if !ok {
 			appHash = nil
 		}
 	}
 	if appHash == nil {
-		appHash, updates = l.finalizeDirect(block, body)
+		appHash, updates, txResults, events = l.finalizeDirect(block, body)
 	}
-	l.recordCommitted(block, appHash, updates)
+	l.recordCommitted(block, appHash, updates, txResults, events)
 }
 
 // finalizeDirect — synchronous FinalizeBlock+Commit for one block (opMu
 // serializes the store-touching pair against the spec worker).
-func (l *Ledger) finalizeDirect(block *cstypes.ConsensusFullBlock, body *EvmBody) ([]byte, []abcitypes.ValidatorUpdate) {
+func (l *Ledger) finalizeDirect(block *cstypes.ConsensusFullBlock, body *EvmBody) ([]byte, []abcitypes.ValidatorUpdate, []*abcitypes.ExecTxResult, []abcitypes.Event) {
 	h := block.Header
 	seq := int64(h.SeqNum.Uint64())
 	l.app.opMu.Lock()
@@ -248,17 +258,21 @@ func (l *Ledger) finalizeDirect(block *cstypes.ConsensusFullBlock, body *EvmBody
 	if err := l.app.Commit(context.Background()); err != nil {
 		panic(fmt.Sprintf("bridge: Commit h=%d: %v", seq, err))
 	}
-	return res.AppHash, res.ValidatorUpdates
+	return res.AppHash, res.ValidatorUpdates, res.TxResults, res.Events
 }
 
 // recordCommitted — canonical bookkeeping after a block commits.
-func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []byte, updates []abcitypes.ValidatorUpdate) {
+func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []byte, updates []abcitypes.ValidatorUpdate,
+	txResults []*abcitypes.ExecTxResult, events []abcitypes.Event) {
 	h := block.Header
 	body := block.Body.Inner.ExecutionBody.(*EvmBody)
 	l.app.recordCommit(int64(h.SeqNum.Uint64()), resultEntry{
-		header:  &EvmFinalizedHeader{Number: h.SeqNum, AppHash: appHash},
-		blockID: h.GetId(),
-		txs:     body.Txs,
+		header:     &EvmFinalizedHeader{Number: h.SeqNum, AppHash: appHash},
+		blockID:    h.GetId(),
+		txs:        body.Txs,
+		txResults:  txResults,
+		events:     events,
+		valUpdates: updates,
 	})
 	l.committed[h.SeqNum] = block
 	if err := l.app.applyUpdates(updates); err != nil {
@@ -272,6 +286,8 @@ func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []by
 // replay as an "orphan" would roll back the just-synced store. The spec
 // frontier is re-anchored wholesale via SpecApp.ResetToHeight at DoneSync.
 func (l *Ledger) applySyncedBlock(block *cstypes.ConsensusFullBlock) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	seq := int64(block.GetSeqNum().Uint64())
 	if seq <= l.app.committedHeight() {
 		return
@@ -285,17 +301,33 @@ func (l *Ledger) applySyncedBlock(block *cstypes.ConsensusFullBlock) {
 	if height := l.app.committedHeight(); seq != height+1 {
 		panic(fmt.Sprintf("bridge: synced block seq %d at height %d — gaps", seq, height))
 	}
-	appHash, updates := l.finalizeDirect(block, body)
-	l.recordCommitted(block, appHash, updates)
+	appHash, updates, txResults, events := l.finalizeDirect(block, body)
+	l.recordCommitted(block, appHash, updates, txResults, events)
 }
 
 // committedBlock — canonical finalized block at seq (statesync serving).
 func (l *Ledger) committedBlock(seq types.SeqNum) *cstypes.ConsensusFullBlock {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.committed[seq]
+}
+
+// committedBlockByID — canonical block lookup by ID (RPC /block_by_hash).
+func (l *Ledger) committedBlockByID(id types.BlockId) *cstypes.ConsensusFullBlock {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	for _, b := range l.committed {
+		if b.GetId() == id {
+			return b
+		}
+	}
+	return nil
 }
 
 // committedSeq — highest committed seq (statesync service window).
 func (l *Ledger) committedSeq() types.SeqNum {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	var max types.SeqNum
 	for seq := range l.committed {
 		if seq > max {

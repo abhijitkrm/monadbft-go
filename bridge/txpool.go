@@ -191,6 +191,40 @@ func (t *TxPool) SendTransaction(tx []byte) {
 	if len(inserted) == 0 {
 		return
 	}
+	t.enqueueForward(inserted)
+}
+
+// SubmitTx — the RPC broadcast path: CheckTx + InsertTx + forward enqueue,
+// returning the CheckTx outcome for the sync-response. Errors are the
+// CheckTx failure (code/log) or a transport-level error, matching
+// CometBFT's broadcast_tx_sync semantics.
+func (t *TxPool) SubmitTx(tx []byte) (uint32, string, error) {
+	ctx := context.Background()
+	t.app.opMu.Lock()
+	res, err := t.app.app.CheckTx(ctx, &abcitypes.RequestCheckTx{
+		Tx:   tx,
+		Type: abcitypes.CheckTxType_New,
+	})
+	if err != nil {
+		t.app.opMu.Unlock()
+		return 0, "", err
+	}
+	if res.Code != 0 {
+		t.app.opMu.Unlock()
+		return res.Code, res.Log, nil
+	}
+	if _, err := t.app.app.InsertTx(ctx, &abcitypes.RequestInsertTx{Tx: tx}); err != nil {
+		t.app.opMu.Unlock()
+		return 0, "", err
+	}
+	t.app.opMu.Unlock()
+	t.enqueueForward([][]byte{tx})
+	return 0, "", nil
+}
+
+// enqueueForward — queue EvMempoolForwardTxs batches for the upcoming
+// leaders under the upstream size caps.
+func (t *TxPool) enqueueForward(inserted [][]byte) {
 	var batch [][]byte
 	batchBytes := 0
 	flush := func() {

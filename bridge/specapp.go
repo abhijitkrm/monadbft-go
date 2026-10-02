@@ -61,9 +61,11 @@ type specJob struct {
 
 // specEntry — one speculatively-executed block's durable outputs.
 type specEntry struct {
-	appHash []byte
-	updates []abcitypes.ValidatorUpdate
-	blockID types.BlockId
+	appHash   []byte
+	updates   []abcitypes.ValidatorUpdate
+	txResults []*abcitypes.ExecTxResult
+	events    []abcitypes.Event
+	blockID   types.BlockId
 }
 
 // NewSpecApp wraps an initialized app (InitChain'd, height 0 committed) in
@@ -182,7 +184,8 @@ func (s *SpecApp) runSpec(ctx context.Context, req *abcitypes.RequestFinalizeBlo
 	}
 	s.tip = req.Height
 	s.tipID = blockID
-	e := specEntry{appHash: res.AppHash, updates: res.ValidatorUpdates, blockID: blockID}
+	e := specEntry{appHash: res.AppHash, updates: res.ValidatorUpdates,
+		txResults: res.TxResults, events: res.Events, blockID: blockID}
 	s.bySeq[req.Height] = e
 	s.byID[blockID] = req.Height
 	return res.AppHash, nil
@@ -227,7 +230,7 @@ func (s *SpecApp) SpecTip() int64 {
 // app.results owns them from here.
 // Lock order is always opMu → mu (the rewind path writes the store while
 // the async worker may hold opMu mid-Commit).
-func (s *SpecApp) CommittedResult(seq int64, blockID types.BlockId, parentID func(h int64) types.BlockId) ([]byte, []abcitypes.ValidatorUpdate, bool) {
+func (s *SpecApp) CommittedResult(seq int64, blockID types.BlockId, parentID func(h int64) types.BlockId) ([]byte, []abcitypes.ValidatorUpdate, []*abcitypes.ExecTxResult, []abcitypes.Event, bool) {
 	s.app.opMu.Lock()
 	defer s.app.opMu.Unlock()
 	s.mu.Lock()
@@ -241,7 +244,7 @@ func (s *SpecApp) CommittedResult(seq int64, blockID types.BlockId, parentID fun
 				delete(s.bySeq, h)
 			}
 		}
-		return e.appHash, e.updates, true
+		return e.appHash, e.updates, e.txResults, e.events, true
 	}
 	if specd {
 		if err := s.rewindLocked(seq-1, parentID(seq-1)); err != nil {
@@ -260,7 +263,7 @@ func (s *SpecApp) CommittedResult(seq int64, blockID types.BlockId, parentID fun
 			delete(s.bySeq, h)
 		}
 	}
-	return nil, nil, false
+	return nil, nil, nil, nil, false
 }
 
 // Rewind — discard spec heights above h and roll the store back

@@ -11,6 +11,7 @@ import (
 	cmtcrypto "github.com/cometbft/cometbft/crypto"
 	cmted25519 "github.com/cometbft/cometbft/crypto/ed25519"
 	cryptoenc "github.com/cometbft/cometbft/crypto/encoding"
+	"github.com/cometbft/cometbft/crypto/tmhash"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	cmttypes "github.com/cometbft/cometbft/types"
 	"github.com/cosmos/evm/evmd"
@@ -96,6 +97,7 @@ type App struct {
 	mu      sync.Mutex
 	height  int64                 // last committed height
 	results map[int64]resultEntry // committed height → execution result
+	txIndex map[string]int64      // tmhash hex → committed height (RPC /tx)
 
 	// opMu serializes store-touching ABCI calls. With SpecApp's async
 	// worker, FinalizeBlock+Commit run off the node loop while
@@ -106,9 +108,12 @@ type App struct {
 }
 
 type resultEntry struct {
-	header  *EvmFinalizedHeader
-	blockID types.BlockId
-	txs     [][]byte
+	header     *EvmFinalizedHeader
+	blockID    types.BlockId
+	txs        [][]byte
+	txResults  []*abcitypes.ExecTxResult
+	events     []abcitypes.Event
+	valUpdates []abcitypes.ValidatorUpdate
 }
 
 // NewApp wraps an ABCI application with genesis validator bookkeeping.
@@ -123,6 +128,7 @@ func NewApp(app abcitypes.Application, vals []Validator) *App {
 		monadVals: monadVals,
 		byCons:    map[string]int{},
 		results:   map[int64]resultEntry{},
+		txIndex:   map[string]int64{},
 	}
 	for i := range monadVals {
 		a.byCons[string(monadVals[i].ConsAddr())] = i
@@ -246,6 +252,39 @@ func (a *App) recordCommit(seq int64, entry resultEntry) {
 	defer a.mu.Unlock()
 	a.height = seq
 	a.results[seq] = entry
+	for _, tx := range entry.txs {
+		a.txIndex[fmt.Sprintf("%X", tmhash.Sum(tx))] = seq
+	}
+}
+
+// TxLookup — the height a tx hash committed at (CometBFT tx-hash = tmhash).
+func (a *App) TxLookup(hashHex string) (height int64, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	h, ok := a.txIndex[hashHex]
+	return h, ok
+}
+
+// CommittedEntry — the full committed record at height h for RPC serving.
+func (a *App) CommittedEntry(h int64) (header *EvmFinalizedHeader, blockID types.BlockId, txs [][]byte,
+	txResults []*abcitypes.ExecTxResult, events []abcitypes.Event, updates []abcitypes.ValidatorUpdate, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, found := a.results[h]
+	if !found {
+		return nil, types.BlockId{}, nil, nil, nil, nil, false
+	}
+	return e.header, e.blockID, e.txs, e.txResults, e.events, e.valUpdates, true
+}
+
+// Validators — the current canonical app-side validator set.
+func (a *App) Validators() []*cmttypes.Validator {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.appSet == nil {
+		return nil
+	}
+	return append([]*cmttypes.Validator(nil), a.appSet.Validators...)
 }
 
 // committedHeight — ledger-facing read of the last committed height.
