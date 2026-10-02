@@ -115,6 +115,17 @@ type Logger struct {
 
 // Push — Rust WALogger::push: append one serialized event record.
 func (l *Logger) Push(payload []byte) error {
+	return l.push(payload, l.sync)
+}
+
+// PushNoSync — append without fsync even when sync mode is on. For
+// high-frequency events (timestamp ticks) where per-record durability adds
+// nothing but a full-page fsync does real harm on slow disks.
+func (l *Logger) PushNoSync(payload []byte) error {
+	return l.push(payload, false)
+}
+
+func (l *Logger) push(payload []byte, doSync bool) error {
 	if uint64(len(payload)) > math.MaxUint32 {
 		return fmt.Errorf("wal: serialized event exceeds u32 header size")
 	}
@@ -136,7 +147,7 @@ func (l *Logger) Push(payload []byte) error {
 		return err
 	}
 	l.current.size += msgLen
-	if l.sync {
+	if doSync {
 		return l.current.handle.Sync()
 	}
 	return nil

@@ -85,6 +85,9 @@ func (p *Persistence) logEvent(ev glue.MonadEvent) error {
 	if err != nil {
 		return fmt.Errorf("wal serialize %T: %w", ev, err)
 	}
+	if _, ts := ev.(glue.EvTimestampUpdate); ts {
+		return p.WAL.PushNoSync(payload)
+	}
 	return p.WAL.Push(payload)
 }
 
