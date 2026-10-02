@@ -8,6 +8,7 @@ import (
 
 	"github.com/abhijitkrm/monadbft-go/blocksync"
 	"github.com/abhijitkrm/monadbft-go/blocktree"
+	"github.com/abhijitkrm/monadbft-go/consensus"
 	"github.com/abhijitkrm/monadbft-go/consensusstate"
 	"github.com/abhijitkrm/monadbft-go/crypto"
 	"github.com/abhijitkrm/monadbft-go/cstypes"
@@ -91,6 +92,10 @@ type MonadState struct {
 	whitelistedStatesyncNodes map[types.NodeId]struct{}
 	statesyncExpandToGroup    bool
 	serveStatesync            bool
+
+	// restoredSafety — durable watermarks merged into Safety at the live
+	// transition (crash recovery); consumed once.
+	restoredSafety *consensus.Safety
 }
 
 // Builder — Rust MonadStateBuilder.
@@ -113,6 +118,12 @@ type Builder struct {
 	WhitelistedStatesyncNodes map[types.NodeId]struct{}
 	StatesyncExpandToGroup    bool
 	ServeStatesync            bool
+
+	// RestoredSafety — durable safety watermarks loaded after a crash.
+	// Merged (element-wise max) into the fresh Safety when the node goes
+	// live; watermarks never move backward, so merge can only make the node
+	// more conservative. Nil on fresh boot.
+	RestoredSafety *consensus.Safety
 
 	ConsensusConfig *consensusstate.Config
 }
@@ -171,6 +182,8 @@ func (b Builder) Build() (*MonadState, []glue.Command) {
 		whitelistedStatesyncNodes: b.WhitelistedStatesyncNodes,
 		statesyncExpandToGroup:    b.StatesyncExpandToGroup,
 		serveStatesync:            b.ServeStatesync,
+
+		restoredSafety: b.RestoredSafety,
 	}
 	if ms.whitelistedStatesyncNodes == nil {
 		ms.whitelistedStatesyncNodes = make(map[types.NodeId]struct{})
@@ -666,6 +679,12 @@ func (m *MonadState) maybeStartConsensus() []glue.Command {
 	cachedProposals := bb.Proposals()
 
 	live := consensusstate.NewConsensusState(m.epochManager, m.consensusConfig, *rootInfo, m.consensus.highCertificate)
+	if m.restoredSafety != nil {
+		// Crash recovery: fold the durable watermarks over the
+		// forkpoint-derived ones. Max-merge only moves them forward.
+		live.Safety.Merge(m.restoredSafety)
+		m.restoredSafety = nil
+	}
 	// bind the shared environment into the wrapper
 	liveState := &consensusstate.State{
 		Consensus:      live,

@@ -4,6 +4,8 @@ package consensus
 
 import (
 	"github.com/abhijitkrm/monadbft-go/cstypes"
+	"github.com/abhijitkrm/monadbft-go/exec"
+	"github.com/abhijitkrm/monadbft-go/rlp"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
@@ -158,4 +160,156 @@ func (s *Safety) HandleProposal(round types.Round) {
 		delete(s.handledProposals, s.handledProposalsOrder[0])
 		s.handledProposalsOrder = s.handledProposalsOrder[1:]
 	}
+}
+
+// ---------------------------------------------------------------------------
+// SafetySnapshot — durable safety watermarks for crash recovery.
+// ---------------------------------------------------------------------------
+
+// Every field is a "highest X" watermark — they only ever move forward, so
+// restoring an older-than-truth snapshot is the double-sign hazard (the node
+// would re-vote/re-propose a round it already signed). Persistence must
+// therefore happen before the guarded action reaches the wire, and merging
+// is element-wise max — never rollback.
+//
+// handledProposals is not persisted: it is a dedup cache only, and a
+// re-processed proposal can never produce an unsafe signature — the
+// watermarks still gate Vote/NoEndorse/Propose.
+type SafetySnapshot struct {
+	MaybeHighTip           *cstypes.ConsensusTip
+	HighCertificateQcRound types.Round
+	HighestVote            types.Round
+	HighestNoEndorseRound  types.Round
+	HighestNoEndorseTip    types.BlockId
+	HighestPropose         types.Round
+	HighestRecoveryRequest types.Round
+}
+
+// Snapshot — durable copy of the safety watermarks.
+func (s *Safety) Snapshot() *SafetySnapshot {
+	var tip *cstypes.ConsensusTip
+	if s.maybeHighTip != nil {
+		t := *s.maybeHighTip
+		tip = &t
+	}
+	return &SafetySnapshot{
+		MaybeHighTip:           tip,
+		HighCertificateQcRound: s.highCertificateQcRound,
+		HighestVote:            s.highestVote,
+		HighestNoEndorseRound:  s.highestNoEndorse.round,
+		HighestNoEndorseTip:    s.highestNoEndorse.tip,
+		HighestPropose:         s.highestPropose,
+		HighestRecoveryRequest: s.highestRecoveryRequest,
+	}
+}
+
+// SafetyFromSnapshot — rehydrate Safety from durable watermarks.
+func SafetyFromSnapshot(snap *SafetySnapshot) *Safety {
+	return &Safety{
+		maybeHighTip:           snap.MaybeHighTip,
+		highCertificateQcRound: snap.HighCertificateQcRound,
+		highestVote:            snap.HighestVote,
+		highestNoEndorse:       highNoEndorse{round: snap.HighestNoEndorseRound, tip: snap.HighestNoEndorseTip},
+		highestPropose:         snap.HighestPropose,
+		highestRecoveryRequest: snap.HighestRecoveryRequest,
+		handledProposals:       make(map[types.Round]struct{}),
+	}
+}
+
+// Merge — element-wise max of the watermarks (plus the fresher high tip).
+// Used on restart: the persisted snapshot is merged over the
+// forkpoint-derived Safety so a watermark can only move forward.
+func (s *Safety) Merge(o *Safety) {
+	if o.highCertificateQcRound > s.highCertificateQcRound {
+		s.highCertificateQcRound = o.highCertificateQcRound
+	}
+	if o.highestVote > s.highestVote {
+		s.highestVote = o.highestVote
+	}
+	if o.highestNoEndorse.round > s.highestNoEndorse.round {
+		s.highestNoEndorse = o.highestNoEndorse
+	}
+	if o.highestPropose > s.highestPropose {
+		s.highestPropose = o.highestPropose
+	}
+	if o.highestRecoveryRequest > s.highestRecoveryRequest {
+		s.highestRecoveryRequest = o.highestRecoveryRequest
+	}
+	// A persisted high tip counts only if it still outranks the merged
+	// certificate round — mirrors ProcessCertificate's staleness rule.
+	if o.maybeHighTip != nil &&
+		o.maybeHighTip.BlockHeader.BlockRound > s.highCertificateQcRound {
+		if s.maybeHighTip == nil ||
+			o.maybeHighTip.BlockHeader.BlockRound > s.maybeHighTip.BlockHeader.BlockRound {
+			t := *o.maybeHighTip
+			s.maybeHighTip = &t
+		}
+	}
+}
+
+func (s SafetySnapshot) EncodeRLP(dst []byte) []byte {
+	return rlp.AppendList(dst, func(p []byte) []byte {
+		// Option<ConsensusTip>: [] for None, [tip] for Some.
+		p = rlp.AppendList(p, func(q []byte) []byte {
+			if s.MaybeHighTip != nil {
+				q = s.MaybeHighTip.EncodeRLP(q)
+			}
+			return q
+		})
+		p = s.HighCertificateQcRound.EncodeRLP(p)
+		p = s.HighestVote.EncodeRLP(p)
+		p = s.HighestNoEndorseRound.EncodeRLP(p)
+		p = s.HighestNoEndorseTip.EncodeRLP(p)
+		p = s.HighestPropose.EncodeRLP(p)
+		p = s.HighestRecoveryRequest.EncodeRLP(p)
+		return p
+	})
+}
+
+func (s *SafetySnapshot) DecodeRLP(st *rlp.Stream, ep *exec.Protocol) error {
+	l, err := st.List()
+	if err != nil {
+		return err
+	}
+	ol, err := l.List()
+	if err != nil {
+		return err
+	}
+	if ol.Remaining() > 0 {
+		var tip cstypes.ConsensusTip
+		if err := tip.DecodeRLP(ol, ep); err != nil {
+			return err
+		}
+		s.MaybeHighTip = &tip
+	}
+	if err := ol.Done(); err != nil {
+		return err
+	}
+	read := func(dst *types.Round) error {
+		v, err := l.Uint64()
+		if err != nil {
+			return err
+		}
+		*dst = types.Round(v)
+		return nil
+	}
+	if err := read(&s.HighCertificateQcRound); err != nil {
+		return err
+	}
+	if err := read(&s.HighestVote); err != nil {
+		return err
+	}
+	if err := read(&s.HighestNoEndorseRound); err != nil {
+		return err
+	}
+	if err := s.HighestNoEndorseTip.DecodeRLP(l); err != nil {
+		return err
+	}
+	if err := read(&s.HighestPropose); err != nil {
+		return err
+	}
+	if err := read(&s.HighestRecoveryRequest); err != nil {
+		return err
+	}
+	return l.Done()
 }
