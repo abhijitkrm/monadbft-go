@@ -25,7 +25,17 @@ const (
 // encodeAppMessageEnvelope wraps an RLP-encoded app message into the
 // router envelope: [[1, 1], 0x01, <app message rlp>].
 func encodeAppMessageEnvelope(appMessageRLP []byte) ([]byte, error) {
-	if len(appMessageRLP) == 0 {
+	return encodeEnvelope(messageTypeApp, appMessageRLP)
+}
+
+// encodePeerDiscoveryEnvelope — OutboundRouterMessage::PeerDiscoveryMessage:
+// [[1, 1], 0x02, <peerdisc message rlp>].
+func encodePeerDiscoveryEnvelope(msgRLP []byte) ([]byte, error) {
+	return encodeEnvelope(messageTypePeerDisc, msgRLP)
+}
+
+func encodeEnvelope(kind uint8, msgRLP []byte) ([]byte, error) {
+	if len(msgRLP) == 0 {
 		return nil, ErrAppMessageEmpty
 	}
 	out := rlp.AppendList(nil, func(p []byte) []byte {
@@ -34,8 +44,8 @@ func encodeAppMessageEnvelope(appMessageRLP []byte) ([]byte, error) {
 			v = rlp.AppendUint8(v, 1)  // compression_version: uncompressed
 			return v
 		})
-		p = rlp.AppendUint8(p, messageTypeApp)
-		p = rlp.AppendRaw(p, appMessageRLP)
+		p = rlp.AppendUint8(p, kind)
+		p = rlp.AppendRaw(p, msgRLP)
 		return p
 	})
 	if len(out) > MaxMessageSize {
@@ -84,7 +94,7 @@ func decodeRouterEnvelope(data []byte) (*decodedRouterMessage, error) {
 		if err != nil {
 			return err
 		}
-		if kind != messageTypeApp {
+		if kind != messageTypeApp && kind != messageTypePeerDisc && kind != messageTypeGroup {
 			return fmt.Errorf("%w: %d", ErrUnknownMessageType, kind)
 		}
 		// remaining stream bytes = the app message element
@@ -104,6 +114,35 @@ func decodeRouterEnvelope(data []byte) (*decodedRouterMessage, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// Exported envelope accessors for the composite node transport — the TCP
+// fallback signs and carries the same [[1,1],kind,payload] envelope as UDP.
+const (
+	MessageTypeApp      = messageTypeApp
+	MessageTypePeerDisc = messageTypePeerDisc
+	MessageTypeGroup    = messageTypeGroup
+)
+
+// EncodeAppMessageEnvelope wraps an RLP-encoded app message (kind 1).
+func EncodeAppMessageEnvelope(msgRLP []byte) ([]byte, error) {
+	return encodeAppMessageEnvelope(msgRLP)
+}
+
+// EncodePeerDiscoveryEnvelope wraps an RLP-encoded PeerDiscoveryMessage
+// (kind 2).
+func EncodePeerDiscoveryEnvelope(msgRLP []byte) ([]byte, error) {
+	return encodePeerDiscoveryEnvelope(msgRLP)
+}
+
+// DecodeRouterEnvelope — InboundRouterMessage::try_deserialize; returns the
+// message kind and the raw inner RLP payload.
+func DecodeRouterEnvelope(data []byte) (uint8, []byte, error) {
+	m, err := decodeRouterEnvelope(data)
+	if err != nil {
+		return 0, nil, err
+	}
+	return m.kind, m.payload, nil
 }
 
 // rlpItemLen returns the encoded length of the first RLP item in b.

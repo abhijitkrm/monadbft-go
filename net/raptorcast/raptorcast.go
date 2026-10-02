@@ -18,10 +18,9 @@ import (
 // raptorcast/broadcast/point-to-point UDP writes, and inbound datagrams are
 // decoded and delivered to the registered handler as (author, app message).
 
-// UDPSink abstracts the dataplane UDP writer.
+// UDPSink abstracts the dataplane UDP writer (Rust DualUdpPacketSender sink).
 type UDPSink interface {
 	WriteUnicastWithPriority(msg UDPSendBatch, priority int)
-	WriteBroadcastWithPriority(targets []netip.AddrPort, payload []byte, stride uint16, priority int)
 }
 
 // UDPSendBatch is one or more payloads sharing a stride.
@@ -31,8 +30,9 @@ type UDPSendBatch struct {
 }
 
 type UDPSendItem struct {
-	Dst     netip.AddrPort
-	Payload []byte
+	Recipient types.NodeId   // intended receiver (chunk/broadcast target)
+	Dst       netip.AddrPort // resolved authenticated UDP addr (sink may re-resolve)
+	Payload   []byte
 }
 
 // PeerAddrSource resolves a peer's UDP address (authenticated socket
@@ -40,6 +40,13 @@ type UDPSendItem struct {
 type PeerAddrSource interface {
 	LookupUDPAddr(id types.NodeId) (netip.AddrPort, bool)
 }
+
+// UDP send priorities — values match dataplane.UdpPriority so transports can
+// forward them unchanged (upstream UdpPriority: High drains first).
+const (
+	UdpPriorityHigh    = 0
+	UdpPriorityRegular = 1
+)
 
 // Options — the RaptorCastConfig knobs the primary path uses.
 type Options struct {
@@ -66,13 +73,16 @@ type Raptorcast struct {
 	key    *crypto.SecpKeyPair
 	opts   Options
 
-	mu        sync.Mutex
-	valSets   map[types.Epoch]*validator.ValidatorSet
-	addrs     PeerAddrSource
-	sink      UDPSink
-	handler   func(from types.NodeId, payload []byte)
-	state     *udpState
-	published *publishedRounds
+	mu          sync.Mutex
+	valSets     map[types.Epoch]*validator.ValidatorSet
+	addrs       PeerAddrSource
+	sink        UDPSink
+	handler     func(from types.NodeId, payload []byte)
+	pdHandler   func(author types.NodeId, srcAddr netip.AddrPort, payload []byte)
+	state       *udpState
+	published   *publishedRounds
+	curEpoch    types.Epoch
+	hasCurEpoch bool
 }
 
 func New(selfID types.NodeId, key *crypto.SecpKeyPair, addrs PeerAddrSource, sink UDPSink, opts Options) *Raptorcast {
@@ -92,6 +102,31 @@ func (r *Raptorcast) SetHandler(h func(from types.NodeId, payload []byte)) {
 	r.mu.Lock()
 	r.handler = h
 	r.mu.Unlock()
+}
+
+// SetPeerDiscHandler — decoded type-2 (PeerDiscoveryMessage) envelopes are
+// routed here instead of the app handler (Rust: pd_driver.update on rx).
+// srcAddr is the datagram's source socket for PeerSource.
+func (r *Raptorcast) SetPeerDiscHandler(h func(author types.NodeId, srcAddr netip.AddrPort, payload []byte)) {
+	r.mu.Lock()
+	r.pdHandler = h
+	r.mu.Unlock()
+}
+
+// UpdateCurrentRound — Rust RouterCommand::UpdateCurrentRound: tracks the
+// current epoch for point-to-point builds and prunes expired epoch valsets.
+func (r *Raptorcast) UpdateCurrentRound(epoch types.Epoch, _ types.Round) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if epoch > r.curEpoch {
+		r.curEpoch = epoch
+		r.hasCurEpoch = true
+		for e := range r.valSets { // upstream retains epoch >= current-1
+			if e+1 < epoch {
+				delete(r.valSets, e)
+			}
+		}
+	}
 }
 
 // AddEpochValidatorSet — RouterCommand::AddEpochValidatorSet.
@@ -170,18 +205,9 @@ func (r *Raptorcast) sendWithPriority(target types.RouterTarget, appMsg []byte, 
 			r.deliverToSelf(appMsg)
 			return nil
 		}
-		r.mu.Lock()
-		// P2P group id: current epoch — upstream uses current_epoch.
-		var epoch types.Epoch
-		for e := range r.valSets {
-			if e > epoch {
-				epoch = e
-			}
-		}
-		r.mu.Unlock()
 		bt := &buildTarget{
 			mode:      BroadcastUnspecified,
-			epoch:     epoch,
+			epoch:     r.currentEpoch(),
 			recipient: target.To,
 		}
 		return r.buildAndSend(envelope, bt, priority)
@@ -189,6 +215,47 @@ func (r *Raptorcast) sendWithPriority(target types.RouterTarget, appMsg []byte, 
 	default:
 		return errors.New("unsupported router target kind")
 	}
+}
+
+// currentEpoch — the tracked round epoch (upstream self.current_epoch),
+// falling back to the newest installed valset when no UpdateCurrentRound has
+// arrived yet (single-node/devnet bring-up).
+func (r *Raptorcast) currentEpoch() types.Epoch {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.hasCurEpoch {
+		return r.curEpoch
+	}
+	var epoch types.Epoch
+	for e := range r.valSets {
+		if e > epoch {
+			epoch = e
+		}
+	}
+	return epoch
+}
+
+// SendPeerDiscovery — Rust send_peer_disc_msg: wrap a serialized
+// PeerDiscoveryMessage in a type-2 envelope and unicast it to the target
+// through the regular p2p chunk path.
+func (r *Raptorcast) SendPeerDiscovery(to types.NodeId, msgRLP []byte, priority int) error {
+	env, err := encodePeerDiscoveryEnvelope(msgRLP)
+	if err != nil {
+		return err
+	}
+	bt := &buildTarget{mode: BroadcastUnspecified, epoch: r.currentEpoch(), recipient: to}
+	return r.buildAndSend(env, bt, priority)
+}
+
+// SendToNode — RouterCommand::PublishToFullNodes inner loop: app envelope
+// unicasted to one node under the command's epoch.
+func (r *Raptorcast) SendToNode(epoch types.Epoch, to types.NodeId, appMsg []byte, priority int) error {
+	env, err := encodeAppMessageEnvelope(appMsg)
+	if err != nil {
+		return err
+	}
+	bt := &buildTarget{mode: BroadcastUnspecified, epoch: epoch, recipient: to}
+	return r.buildAndSend(env, bt, priority)
 }
 
 func (r *Raptorcast) deliverToSelf(appMsg []byte) {
@@ -213,8 +280,10 @@ func (r *Raptorcast) buildAndSend(envelope []byte, bt *buildTarget, priority int
 		return ErrRedundancyTooHigh
 	}
 
-	// collect chunks per destination
-	perDst := make(map[netip.AddrPort][][]byte)
+	// collect chunks per destination — upstream's sink receives
+	// UdpMessage{recipient, payload} and resolves the name record inside; we
+	// keep the resolved auth addr on the item for simple sinks.
+	perDst := make(map[netip.AddrPort][]UDPSendItem)
 	order := make([]netip.AddrPort, 0)
 	err := buildInto(r.key, layout, r.opts.Redundancy, unixTsMsNow(), envelope, bt, func(m udpMessage) {
 		dst, ok := r.addrs.LookupUDPAddr(m.recipient)
@@ -224,18 +293,13 @@ func (r *Raptorcast) buildAndSend(envelope []byte, bt *buildTarget, priority int
 		if _, seen := perDst[dst]; !seen {
 			order = append(order, dst)
 		}
-		perDst[dst] = append(perDst[dst], m.payload)
+		perDst[dst] = append(perDst[dst], UDPSendItem{Recipient: m.recipient, Dst: dst, Payload: m.payload})
 	})
 	if err != nil {
 		return err
 	}
 	for _, dst := range order {
-		payloads := perDst[dst]
-		items := make([]UDPSendItem, len(payloads))
-		for i, p := range payloads {
-			items[i] = UDPSendItem{Dst: dst, Payload: p}
-		}
-		r.sink.WriteUnicastWithPriority(UDPSendBatch{Items: items, Stride: uint16(r.opts.SegmentSize)}, priority)
+		r.sink.WriteUnicastWithPriority(UDPSendBatch{Items: perDst[dst], Stride: uint16(r.opts.SegmentSize)}, priority)
 	}
 	return nil
 }
@@ -264,27 +328,43 @@ func (r *Raptorcast) HandleDatagram(srcAddr netip.AddrPort, sender *types.NodeId
 		if err != nil {
 			continue
 		}
-		r.mu.Lock()
-		h := r.handler
-		r.mu.Unlock()
-		if h != nil {
-			h(dm.Author, env.payload)
+		switch env.kind {
+		case messageTypeApp:
+			r.mu.Lock()
+			h := r.handler
+			r.mu.Unlock()
+			if h != nil {
+				h(dm.Author, env.payload)
+			}
+		case messageTypePeerDisc:
+			r.mu.Lock()
+			h := r.pdHandler
+			r.mu.Unlock()
+			if h != nil {
+				h(dm.Author, srcAddr, env.payload)
+			}
+		default:
+			// type-3 FullNodesGroup messages are secondary/full-node scope
+			// (Track B B5) — dropped on the primary path.
 		}
 	}
 }
 
-// rebroadcast forwards a received chunk's wire bytes to its targets.
+// rebroadcast forwards a received chunk's wire bytes to its targets — Rust
+// rebroadcast_packet: one write_to_name_record per target at High priority.
 func (r *Raptorcast) rebroadcast(req rebroadcastRequest) {
-	var targets []netip.AddrPort
+	batch := UDPSendBatch{Stride: req.stride}
 	for _, id := range req.targets {
-		if addr, ok := r.addrs.LookupUDPAddr(id); ok {
-			targets = append(targets, addr)
+		addr, ok := r.addrs.LookupUDPAddr(id)
+		if !ok {
+			continue
 		}
+		batch.Items = append(batch.Items, UDPSendItem{Recipient: id, Dst: addr, Payload: req.payload})
 	}
-	if len(targets) == 0 {
+	if len(batch.Items) == 0 {
 		return
 	}
-	r.sink.WriteBroadcastWithPriority(targets, req.payload, req.stride, 0)
+	r.sink.WriteUnicastWithPriority(batch, UdpPriorityHigh)
 }
 
 // publishedRounds — Rust PublishedRounds: bounded set of claimed primary

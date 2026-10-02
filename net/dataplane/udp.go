@@ -213,6 +213,7 @@ func udpSocketListen(id UdpSocketID, addr netip.AddrPort, bufSize int) (*udpSock
 // stride mirrors upstream's RecvUdpMsg.stride (GRO segment size); with plain
 // recvmsg each datagram is its own segment.
 func (s *udpSocket) rxLoop(ingress chan<- RecvUdpMsg, segmentSize uint16, stop <-chan struct{}) {
+	defer close(ingress) // socket teardown ends the read stream
 	buf := make([]byte, 1<<16)
 	for {
 		n, src, err := s.conn.ReadFromUDPAddrPort(buf)

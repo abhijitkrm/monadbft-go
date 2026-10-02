@@ -2,7 +2,9 @@ package glue
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/abhijitkrm/monadbft-go/blocksync"
@@ -583,16 +585,23 @@ func (k *KnownPeersUpdate) DecodeRLP(s *rlp.Stream) error {
 	return l.Done()
 }
 
-// PeerEntry minimal codec — Rust encodes [pubkey, ip-string, signature,
+// PeerEntry codec — Rust encodes [pubkey, ip-string, signature,
 // record_seq_num, auth_port, direct_udp_port, tcp_port, udp_port,
-// encrypted_tcp_port]. Our port carries only (pubkey-as-nodeid, seq, auth_port)
-// so we encode [pubkey, record_seq_num, auth_port] — a divergent but
-// self-consistent layout used only for the never-logged KnownPeersUpdate.
+// encrypted_tcp_port?]. Zero port = absent Option; encrypted_tcp_port is
+// omitted from the tail when absent (upstream's two-arm encoder).
 func (e PeerEntry) EncodeRLP(dst []byte) []byte {
 	return rlp.AppendList(dst, func(p []byte) []byte {
 		p = e.Pubkey.EncodeRLP(p)
+		p = rlp.AppendString(p, []byte(e.Addr.String()))
+		p = rlp.AppendString(p, e.Signature.Serialize())
 		p = rlp.AppendUint64(p, e.RecordSeqNum)
 		p = rlp.AppendUint64(p, uint64(e.AuthPort))
+		p = rlp.AppendUint64(p, uint64(e.DirectUDPPort))
+		p = rlp.AppendUint64(p, uint64(e.TCPPort))
+		p = rlp.AppendUint64(p, uint64(e.UDPPort))
+		if e.EncryptedTCPPort != 0 {
+			p = rlp.AppendUint64(p, uint64(e.EncryptedTCPPort))
+		}
 		return p
 	})
 }
@@ -605,17 +614,68 @@ func (e *PeerEntry) DecodeRLP(s *rlp.Stream) error {
 	if err := e.Pubkey.DecodeRLP(l); err != nil {
 		return err
 	}
-	seq, err := l.Uint64()
+	ipBytes, err := l.Bytes()
 	if err != nil {
 		return err
 	}
-	e.RecordSeqNum = seq
+	addr, err := parsePeerEntryAddr(string(ipBytes))
+	if err != nil {
+		return err
+	}
+	e.Addr = addr
+	sigBytes, err := l.Bytes()
+	if err != nil {
+		return err
+	}
+	if e.Signature, err = crypto.SecpSignatureFromBytes(sigBytes); err != nil {
+		return err
+	}
+	if e.RecordSeqNum, err = l.Uint64(); err != nil {
+		return err
+	}
 	port, err := l.Uint64()
 	if err != nil {
 		return err
 	}
 	e.AuthPort = uint16(port)
+	if e.DirectUDPPort, err = optPort(l); err != nil {
+		return err
+	}
+	if e.TCPPort, err = optPort(l); err != nil {
+		return err
+	}
+	if e.UDPPort, err = optPort(l); err != nil {
+		return err
+	}
+	if l.Remaining() > 0 {
+		if e.EncryptedTCPPort, err = optPort(l); err != nil {
+			return err
+		}
+	}
 	return l.Done()
+}
+
+// optPort reads a u64 port where 0 encodes an absent Option<NonZeroU16>.
+func optPort(l *rlp.Stream) (uint16, error) {
+	v, err := l.Uint64()
+	if err != nil {
+		return 0, err
+	}
+	return uint16(v), nil
+}
+
+// parsePeerEntryAddr — Rust decode accepts either bare IPv4 or the legacy
+// SocketAddrV4 "ip:port" form; the port is folded into tcp/udp upstream, but
+// our record keeps Addr-only so the legacy form just takes the IP.
+func parsePeerEntryAddr(s string) (netip.Addr, error) {
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a, nil
+	}
+	ap, err := netip.ParseAddrPort(s)
+	if err != nil {
+		return netip.Addr{}, errors.New("invalid peer entry address")
+	}
+	return ap.Addr(), nil
 }
 
 func appendPeerEntryList(dst []byte, es []PeerEntry) []byte {

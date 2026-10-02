@@ -369,8 +369,26 @@ func (a *API) acceptCookie(reply *cookieReply) error {
 	return nil
 }
 
+// Dispatch — Rust WireAuthProtocol::dispatch: classify the datagram payload,
+// run control packets through the handshake machine, and decrypt data
+// packets. Returns (nil, nil, nil) for consumed control packets.
+func (a *API) Dispatch(packet []byte, remoteAddr netip.AddrPort) ([]byte, *crypto.SecpPubKey, error) {
+	c, d, err := parsePacket(packet)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c != nil {
+		return nil, nil, a.DispatchControl(c, remoteAddr)
+	}
+	plaintext, pub, err := a.Decrypt(*d, remoteAddr)
+	if err != nil {
+		return nil, nil, err
+	}
+	return plaintext, &pub, nil
+}
+
 // DispatchControl processes a parsed control packet (handshakes, cookie
-// replies, keepalives). Use ParsePacket first.
+// replies, keepalives).
 func (a *API) DispatchControl(c *controlPacket, remoteAddr netip.AddrPort) error {
 	var err error
 	switch c.kind {
@@ -482,6 +500,32 @@ func (a *API) EncryptBySocket(socketAddr netip.AddrPort, plaintext []byte) (data
 	header, timer := transport.encrypt(a.context.RNG(), &a.config, now, plaintext)
 	a.timers.replaceTimer(timer, transport.common.localIndex)
 	return header, nil
+}
+
+// EncryptBySocketPacket — Rust AuthenticatedSocketHandle::encrypt_packet:
+// copies plaintext into a fresh packet buffer, encrypts the body in place,
+// and returns header || ciphertext (caller slices are never mutated).
+func (a *API) EncryptBySocketPacket(socketAddr netip.AddrPort, plaintext []byte) ([]byte, error) {
+	pkt := make([]byte, dataPacketHeaderSize+len(plaintext))
+	copy(pkt[dataPacketHeaderSize:], plaintext)
+	hdr, err := a.EncryptBySocket(socketAddr, pkt[dataPacketHeaderSize:])
+	if err != nil {
+		return nil, err
+	}
+	copy(pkt[:dataPacketHeaderSize], hdr.marshal())
+	return pkt, nil
+}
+
+// EncryptByPublicKeyPacket — encrypt_packet_by_public_key analogue.
+func (a *API) EncryptByPublicKeyPacket(publicKey crypto.SecpPubKey, plaintext []byte) ([]byte, error) {
+	pkt := make([]byte, dataPacketHeaderSize+len(plaintext))
+	copy(pkt[dataPacketHeaderSize:], plaintext)
+	hdr, err := a.EncryptByPublicKey(publicKey, pkt[dataPacketHeaderSize:])
+	if err != nil {
+		return nil, err
+	}
+	copy(pkt[:dataPacketHeaderSize], hdr.marshal())
+	return pkt, nil
 }
 
 // BufferMessage queues message for a peer whose handshake is in flight.

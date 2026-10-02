@@ -6,12 +6,15 @@ package peerdisc
 // executes RouterCommand/PingPongCommand/TimerCommand.
 
 import (
+	"errors"
 	"math/rand/v2"
 	"net/netip"
 	"os"
 	"sort"
 	"time"
 
+	"github.com/abhijitkrm/monadbft-go/crypto"
+	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/rlp"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
@@ -102,8 +105,8 @@ type PeerDiscoveryEvent struct {
 	Round      types.Round
 	Epoch      types.Epoch
 	Validators []types.NodeId
-	// UpdatePeers: validated name records (PeerEntry equivalent)
-	Peers                []MonadNameRecord
+	// UpdatePeers: self-signed peer entries (Rust Vec<PeerEntry>).
+	Peers                []glue.PeerEntry
 	DedicatedFullNodes   []types.NodeId
 	PrioritizedFullNodes []types.NodeId
 	EndRound             types.Round
@@ -131,6 +134,49 @@ const (
 	evUpdateConfirmGroup
 	evRefresh
 )
+
+// --- public event constructors (event kinds stay package-private; callers
+// build events through these, mirroring the Rust enum variants) ---
+
+// InboundEvent — Rust PeerDiscoveryMessage::event_with_source: a decoded
+// discovery message plus the transport-level source (author, src socket).
+func InboundEvent(from PeerSource, m PeerDiscoveryMessage) (PeerDiscoveryEvent, bool) {
+	switch m.Kind {
+	case msgKindPing:
+		return PeerDiscoveryEvent{Kind: evPingRequest, From: from, Ping: *m.Ping}, true
+	case msgKindPong:
+		return PeerDiscoveryEvent{Kind: evPongResponse, From: from, Pong: *m.Pong}, true
+	case msgKindPeerLookupRequest:
+		return PeerDiscoveryEvent{Kind: evPeerLookupRequest, From: from, LookupRequest: *m.LookupRequest}, true
+	case msgKindPeerLookupResponse:
+		return PeerDiscoveryEvent{Kind: evPeerLookupResponse, From: from, LookupResponse: *m.LookupResponse}, true
+	case msgKindFullNodeRaptorcastRequest:
+		return PeerDiscoveryEvent{Kind: evFullNodeRaptorcastRequest, From: from}, true
+	case msgKindFullNodeRaptorcastResponse:
+		return PeerDiscoveryEvent{Kind: evFullNodeRaptorcastResponse, From: from}, true
+	}
+	return PeerDiscoveryEvent{}, false
+}
+
+// UpdateValidatorSetEvent — Rust PeerDiscoveryEvent::UpdateValidatorSet.
+func UpdateValidatorSetEvent(epoch types.Epoch, validators []types.NodeId) PeerDiscoveryEvent {
+	return PeerDiscoveryEvent{Kind: evUpdateValidatorSet, Epoch: epoch, Validators: validators}
+}
+
+// UpdateCurrentRoundEvent — Rust PeerDiscoveryEvent::UpdateCurrentRound.
+func UpdateCurrentRoundEvent(epoch types.Epoch, round types.Round) PeerDiscoveryEvent {
+	return PeerDiscoveryEvent{Kind: evUpdateCurrentRound, Epoch: epoch, Round: round}
+}
+
+// UpdatePeersEvent — Rust PeerDiscoveryEvent::UpdatePeers.
+func UpdatePeersEvent(peers []glue.PeerEntry) PeerDiscoveryEvent {
+	return PeerDiscoveryEvent{Kind: evUpdatePeers, Peers: peers}
+}
+
+// UpdatePinnedNodesEvent — Rust PeerDiscoveryEvent::UpdatePinnedNodes.
+func UpdatePinnedNodesEvent(dedicated, prioritized []types.NodeId) PeerDiscoveryEvent {
+	return PeerDiscoveryEvent{Kind: evUpdatePinnedNodes, DedicatedFullNodes: dedicated, PrioritizedFullNodes: prioritized}
+}
 
 // TimerCommand — Schedule or ScheduleReset.
 type TimerCommand struct {
@@ -988,14 +1034,50 @@ func (d *PeerDiscovery) UpdateValidatorSet(epoch types.Epoch, validators []types
 	return cmds
 }
 
+// MonadNameRecordFromPeerEntry — Rust MonadNameRecord::try_from(&PeerEntry):
+// rebuilds the record and verifies the self-signature under DomainNameRecord.
+func MonadNameRecordFromPeerEntry(e glue.PeerEntry) (MonadNameRecord, error) {
+	nr := NewNameRecordWithPorts(e.Addr, e.TCPPort, e.UDPPort, e.AuthPort,
+		e.DirectUDPPort, e.EncryptedTCPPort, e.RecordSeqNum)
+	if err := nr.validate(); err != nil {
+		return MonadNameRecord{}, err
+	}
+	if !e.Signature.Verify(crypto.DomainNameRecord, rlp.Encode(nr), e.Pubkey.PubKey) {
+		return MonadNameRecord{}, errors.New("peerdisc: peer entry signature invalid")
+	}
+	return MonadNameRecord{NameRecord: nr, Signature: e.Signature}, nil
+}
+
+// PeerEntry — Rust PeerEntry::try_from(&MonadNameRecord) (recover pubkey).
+func (m MonadNameRecord) PeerEntry() (glue.PeerEntry, error) {
+	id, err := m.RecoverPubKey()
+	if err != nil {
+		return glue.PeerEntry{}, err
+	}
+	udp, _ := m.NameRecord.UDPSocket()
+	direct, _ := m.NameRecord.DirectUDPSocket()
+	return glue.PeerEntry{
+		Pubkey:           id,
+		Addr:             m.NameRecord.IP,
+		TCPPort:          m.NameRecord.TCPPort(),
+		UDPPort:          udp.Port(),
+		Signature:        m.Signature,
+		RecordSeqNum:     m.NameRecord.Seq,
+		AuthPort:         m.NameRecord.AuthUDPPort(),
+		DirectUDPPort:    direct.Port(),
+		EncryptedTCPPort: m.NameRecord.EncryptedTCPPort(),
+	}, nil
+}
+
 // UpdatePeers — Rust update_peers (PeerEntry → validated MonadNameRecord).
-func (d *PeerDiscovery) UpdatePeers(peers []MonadNameRecord) []PeerDiscoveryCommand {
+func (d *PeerDiscovery) UpdatePeers(peers []glue.PeerEntry) []PeerDiscoveryCommand {
 	var cmds []PeerDiscoveryCommand
-	for _, nr := range peers {
-		nodeID, err := nr.RecoverPubKey()
+	for _, e := range peers {
+		nr, err := MonadNameRecordFromPeerEntry(e)
 		if err != nil {
 			continue
 		}
+		nodeID := e.Pubkey
 		ok := true
 		for _, s := range nr.AllUDPSockets() {
 			if !d.checkSocketAvailability(nodeID, s) {

@@ -6,8 +6,10 @@ package peerdisc
 
 import (
 	"container/heap"
+	"net/netip"
 	"time"
 
+	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
@@ -151,6 +153,53 @@ func (d *PeerDiscoveryDriver) DrainEmits() []PeerDiscoveryEmit {
 	out := d.emits
 	d.emits = nil
 	return out
+}
+
+// --- runtime accessors (Rust get_name_record / get_ip / get_name_records) ---
+
+// LookupNameRecord — Rust get_name_record: routing_info only (bootstrap and
+// pending-queue entries are reachable via PingPongCommand emits).
+func (d *PeerDiscoveryDriver) LookupNameRecord(id types.NodeId) (MonadNameRecord, bool) {
+	nr, ok := d.pd.RoutingInfo[id]
+	return nr, ok
+}
+
+// NameRecords — Rust get_name_records.
+func (d *PeerDiscoveryDriver) NameRecords() map[types.NodeId]MonadNameRecord {
+	out := make(map[types.NodeId]MonadNameRecord, len(d.pd.RoutingInfo))
+	for id, nr := range d.pd.RoutingInfo {
+		out[id] = nr
+	}
+	return out
+}
+
+// PeerEntries — Rust GetPeers response shape: every routing record converted
+// back to a signed PeerEntry.
+func (d *PeerDiscoveryDriver) PeerEntries() []glue.PeerEntry {
+	out := make([]glue.PeerEntry, 0, len(d.pd.RoutingInfo))
+	for _, nr := range d.pd.RoutingInfo {
+		if e, err := nr.PeerEntry(); err == nil {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// KnownAuthUDPAddrs — Rust get_known_auth_udp_addrs.
+func (d *PeerDiscoveryDriver) KnownAuthUDPAddrs() map[types.NodeId]netip.AddrPort {
+	out := make(map[types.NodeId]netip.AddrPort, len(d.pd.RoutingInfo))
+	for id, nr := range d.pd.RoutingInfo {
+		out[id] = nr.AuthUDPSocket()
+	}
+	return out
+}
+
+// PeerIP — Rust get_ip_by_id.
+func (d *PeerDiscoveryDriver) PeerIP(id types.NodeId) (netip.Addr, bool) {
+	if nr, ok := d.pd.RoutingInfo[id]; ok {
+		return nr.NameRecord.IP, true
+	}
+	return netip.Addr{}, false
 }
 
 // DrainEvents returns and clears expired timer events to feed back into Update.

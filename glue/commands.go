@@ -1,9 +1,11 @@
 package glue
 
 import (
+	"net/netip"
 	"time"
 
 	"github.com/abhijitkrm/monadbft-go/blocksync"
+	"github.com/abhijitkrm/monadbft-go/crypto"
 	"github.com/abhijitkrm/monadbft-go/cstypes"
 	"github.com/abhijitkrm/monadbft-go/exec"
 	"github.com/abhijitkrm/monadbft-go/types"
@@ -481,12 +483,19 @@ type GetFullNodes struct {
 	Response []types.NodeId
 }
 
-// PeerEntry — Rust PeerEntry (discovered peer record). Kept minimal: only the
-// fields the swarm/config paths need are carried.
+// PeerEntry — Rust PeerEntry (self-signed peer record). The signature covers
+// the RLP encoding of the equivalent peerdisc.NameRecord under the
+// DomainNameRecord domain; zero ports encode Rust's absent Option<NonZeroU16>.
 type PeerEntry struct {
-	Pubkey       types.NodeId
-	RecordSeqNum uint64
-	AuthPort     uint16
+	Pubkey           types.NodeId
+	Addr             netip.Addr // IPv4
+	TCPPort          uint16
+	UDPPort          uint16 // 0 = absent
+	Signature        crypto.SecpSignature
+	RecordSeqNum     uint64
+	AuthPort         uint16
+	DirectUDPPort    uint16 // 0 = absent
+	EncryptedTCPPort uint16 // 0 = absent
 }
 
 // ---------------------------------------------------------------------------

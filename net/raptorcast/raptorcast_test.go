@@ -23,13 +23,6 @@ func (s *memSink) WriteUnicastWithPriority(b UDPSendBatch, _ int) {
 	s.sends = append(s.sends, b.Items...)
 	s.mu.Unlock()
 }
-func (s *memSink) WriteBroadcastWithPriority(dsts []netip.AddrPort, payload []byte, stride uint16, _ int) {
-	s.mu.Lock()
-	for _, d := range dsts {
-		s.sends = append(s.sends, UDPSendItem{Dst: d, Payload: payload})
-	}
-	s.mu.Unlock()
-}
 func (s *memSink) drain() []UDPSendItem {
 	s.mu.Lock()
 	defer s.mu.Unlock()

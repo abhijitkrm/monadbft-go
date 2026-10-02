@@ -22,6 +22,14 @@ import (
 //     verified inside MonadState regardless, so a spoofed `from` cannot forge.
 //   - Router management commands (epoch valsets, current round, peer tables)
 //     are advisory to the transport: TCP ignores them, RaptorCast needs them.
+//
+// priorityTransport — optional high-priority egress lane (upstream pushes
+// RouterPublishWithPriority onto UdpPriority::High). Implemented by
+// RaptorcastTransport; TCPTransport is single-lane.
+type priorityTransport interface {
+	SendWithPriority(types.RouterTarget, []byte, int)
+}
+
 type Transport interface {
 	// Send delivers payload to target. Broadcast/Raptorcast fan out over the
 	// transport's peer set for the target epoch; point-to-point kinds deliver

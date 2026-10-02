@@ -2,6 +2,7 @@ package node
 
 import (
 	"github.com/abhijitkrm/monadbft-go/glue"
+	"github.com/abhijitkrm/monadbft-go/net/raptorcast"
 )
 
 // EventSink — push-model event injection: the node's own producers
@@ -146,7 +147,11 @@ func (n *Node) execRouter(cmds []glue.RouterCommand) {
 		case glue.RouterPublish:
 			t.Send(c.Target, c.Message.Serialize())
 		case glue.RouterPublishWithPriority:
-			t.Send(c.Target, c.Message.Serialize()) // no priority lane on TCP
+			if ps, ok := t.(priorityTransport); ok {
+				ps.SendWithPriority(c.Target, c.Message.Serialize(), raptorcast.UdpPriorityHigh)
+			} else {
+				t.Send(c.Target, c.Message.Serialize())
+			}
 		case glue.RouterPublishToFullNodes:
 			t.PublishToFullNodes(c.Epoch, c.Round, c.BroadcastMode, c.Message.Serialize())
 		case glue.RouterAddEpochValidatorSet:

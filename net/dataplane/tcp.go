@@ -132,6 +132,19 @@ func (c *tcpControl) disconnectIP(ip netip.Addr) {
 	}
 }
 
+// disconnectAll — dataplane teardown: close every tracked connection.
+func (c *tcpControl) disconnectAll() {
+	c.mu.Lock()
+	closers := make([]func(), 0, len(c.closers))
+	for _, close := range c.closers {
+		closers = append(closers, close)
+	}
+	c.mu.Unlock()
+	for _, close := range closers {
+		close()
+	}
+}
+
 func (c *tcpControl) disconnectSocket(ip netip.Addr, port uint16) {
 	c.mu.Lock()
 	var hits []func()
@@ -218,8 +231,9 @@ type tcpEgressMsg struct {
 }
 
 // tcpAcceptLoop — accepts with limits, spawns a read loop per connection.
-func tcpAcceptLoop(rl TcpRateLimit, ctl *tcpControl, rs *rxState, ln net.Listener, ingress chan<- RecvTcpMsg, stop <-chan struct{}) {
+func tcpAcceptLoop(rl TcpRateLimit, ctl *tcpControl, rs *rxState, ln net.Listener, ingress chan RecvTcpMsg, stop <-chan struct{}, wg *sync.WaitGroup) {
 	var connID uint64
+	defer wg.Done() // accept loop counts as a producer: read loops can only outlive it
 	go func() { <-stop; _ = ln.Close() }()
 	for {
 		conn, err := ln.Accept()
@@ -238,11 +252,15 @@ func tcpAcceptLoop(rl TcpRateLimit, ctl *tcpControl, rs *rxState, ln net.Listene
 		}
 		id := tcpID{ip: remote.AddrPort().Addr(), port: remote.AddrPort().Port(), id: connID}
 		connID++
-		go tcpReadLoop(newRateLimiter(rl), ctl, token, id, remote.AddrPort(), conn, ingress)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tcpReadLoop(newRateLimiter(rl), ctl, token, id, remote.AddrPort(), conn, ingress, stop)
+		}()
 	}
 }
 
-func tcpReadLoop(rl *rateLimiter, ctl *tcpControl, token *connectionToken, id tcpID, addr netip.AddrPort, conn net.Conn, ingress chan<- RecvTcpMsg) {
+func tcpReadLoop(rl *rateLimiter, ctl *tcpControl, token *connectionToken, id tcpID, addr netip.AddrPort, conn net.Conn, ingress chan<- RecvTcpMsg, stop <-chan struct{}) {
 	defer token.Release()
 	defer ctl.unregister(id)
 	defer conn.Close()
@@ -255,7 +273,11 @@ func tcpReadLoop(rl *rateLimiter, ctl *tcpControl, token *connectionToken, id tc
 		if !rl.check() {
 			return // rate limit exceeded → drop connection
 		}
-		ingress <- RecvTcpMsg{SrcAddr: addr, Payload: payload}
+		select {
+		case ingress <- RecvTcpMsg{SrcAddr: addr, Payload: payload}:
+		case <-stop:
+			return
+		}
 	}
 }
 

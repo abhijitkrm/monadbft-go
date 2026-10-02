@@ -7,6 +7,7 @@ package dataplane
 import (
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -269,7 +270,10 @@ func (b *DataplaneBuilder) Build() (*Dataplane, error) {
 		}
 		d.TcpSockets.push(cfg.id, handle)
 		d.listeners = append(d.listeners, ln)
-		go tcpAcceptLoop(b.tcpConfig.RateLimit, tcpCtl, rxState, ln, ingress, d.stop)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go tcpAcceptLoop(b.tcpConfig.RateLimit, tcpCtl, rxState, ln, ingress, d.stop, &wg)
+		go func() { wg.Wait(); close(ingress) }()
 	}
 
 	d.Control = newDataplaneControl(addrl, expiry, tcpCtl)
@@ -290,6 +294,7 @@ func (d *Dataplane) Close() {
 	for _, l := range d.listeners {
 		_ = l.Close()
 	}
+	d.Control.tcpCtl.disconnectAll()
 }
 
 // DataplaneControl — ban/disconnect/trusted management (Rust DataplaneControl).
