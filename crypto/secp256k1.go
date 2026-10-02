@@ -2,8 +2,10 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	gethsecp "github.com/ethereum/go-ethereum/crypto/secp256k1"
@@ -43,13 +45,16 @@ func SecpPubKeyFromBytes(b []byte) (SecpPubKey, error) {
 		if b[0] != 0x02 && b[0] != 0x03 {
 			return out, errors.New("secp256k1: bad compressed pubkey prefix")
 		}
+		if x, y := gethsecp.DecompressPubkey(b); x == nil || !gethsecp.S256().IsOnCurve(x, y) {
+			return out, errors.New("secp256k1: invalid compressed pubkey point")
+		}
 		copy(out[:], b)
 	case 65:
 		if b[0] != 0x04 {
 			return out, errors.New("secp256k1: bad uncompressed pubkey prefix")
 		}
 		x, y := gethsecp.S256().Unmarshal(b)
-		if x == nil {
+		if x == nil || !gethsecp.S256().IsOnCurve(x, y) {
 			return out, errors.New("secp256k1: invalid uncompressed pubkey")
 		}
 		copy(out[:], gethsecp.CompressPubkey(x, y))
@@ -155,4 +160,30 @@ func SecpSignatureFromBytes(b []byte) (SecpSignature, error) {
 	}
 	copy(out[:], b)
 	return out, nil
+}
+
+// GenerateSecpKeyPair draws a random secret key from rng and returns the
+// keypair. Rust: KeyPair::generate (secp256k1::Keypair::new).
+func GenerateSecpKeyPair(rng io.Reader) (*SecpKeyPair, error) {
+	var sk [SecpSecretKeySize]byte
+	for {
+		if _, err := io.ReadFull(rng, sk[:]); err != nil {
+			return nil, fmt.Errorf("secp256k1: rng: %w", err)
+		}
+		if kp, err := SecpKeyPairFromBytes(sk[:]); err == nil {
+			return kp, nil
+		}
+	}
+}
+
+// ECDH returns the libsecp256k1 default shared secret:
+// SHA-256(compressed shared point). Rust: secp256k1::ecdh::SharedSecret::new.
+func (k *SecpKeyPair) ECDH(pk SecpPubKey) ([32]byte, error) {
+	var out [32]byte
+	x, y := gethsecp.DecompressPubkey(pk[:])
+	if x == nil {
+		return out, errors.New("secp256k1: invalid peer pubkey")
+	}
+	sx, sy := gethsecp.S256().ScalarMult(x, y, k.sk[:])
+	return sha256.Sum256(gethsecp.CompressPubkey(sx, sy)), nil
 }

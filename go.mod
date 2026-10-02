@@ -4,6 +4,7 @@ go 1.25
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/ericlagergren/aegis v0.0.0-20250325060835-cd0defd64358
 	github.com/ethereum/go-ethereum v1.16.8
 	github.com/supranational/blst v0.3.16-0.20250831170142-f48500c1fdbe
 	github.com/zeebo/blake3 v0.2.4
@@ -20,6 +21,7 @@ require (
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
+	github.com/ericlagergren/subtle v0.0.0-20220507045147-890d697da010 // indirect
 	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
