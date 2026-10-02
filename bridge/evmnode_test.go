@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/abhijitkrm/monadbft-go/bridge"
 	"github.com/abhijitkrm/monadbft-go/consensusstate"
 	"github.com/abhijitkrm/monadbft-go/glue"
+	"github.com/abhijitkrm/monadbft-go/net/peerdisc"
 	"github.com/abhijitkrm/monadbft-go/node"
 	"github.com/abhijitkrm/monadbft-go/types"
 
@@ -33,7 +35,10 @@ import (
 // sockets — the wiring a multi-process evmd devnet uses, minus the process
 // boundary (SDK apps are in-process by nature). Complements the swarm tests,
 // which drive the same executors under a discrete-event scheduler.
-func TestEvmOverNodeRuntime(t *testing.T) {
+func TestEvmOverNodeRuntime(t *testing.T)           { testEvmOverNodeRuntime(t, "tcp") }
+func TestEvmOverNodeRuntimeRaptorcast(t *testing.T) { testEvmOverNodeRuntime(t, "raptorcast") }
+
+func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 	const numNodes = 4
 	cfg := bridge.DefaultConfig()
 	// evmd FinalizeBlock takes tens of ms on this loop — the blocksync
@@ -43,13 +48,32 @@ func TestEvmOverNodeRuntime(t *testing.T) {
 
 	// Static peer map: pre-allocate a port per validator.
 	addrs := make([]string, numNodes)
-	for i := range addrs {
+	udpAddrs := make([]netip.AddrPort, numNodes)
+	authAddrs := make([]netip.AddrPort, numNodes)
+	allocPort := func() int {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		addrs[i] = ln.Addr().String()
+		port := ln.Addr().(*net.TCPAddr).Port
 		_ = ln.Close()
+		return port
+	}
+	allocUDPPort := func() int {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := c.LocalAddr().(*net.UDPAddr).Port
+		_ = c.Close()
+		return port
+	}
+	for i := range addrs {
+		addrs[i] = fmt.Sprintf("127.0.0.1:%d", allocPort())
+		if transportKind == "raptorcast" {
+			udpAddrs[i] = netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", allocUDPPort()))
+			authAddrs[i] = netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", allocUDPPort()))
+		}
 	}
 	peerMap := map[types.NodeId]string{}
 	for i, a := range addrs {
@@ -94,10 +118,16 @@ func TestEvmOverNodeRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewValSet node %d: %v", i, err)
 		}
-		transport := node.NewTCPTransport(vals[i].NodeId(), node.TCPConfig{
-			Listen: addrs[i],
-			Peers:  peerMap,
-		})
+		var transport node.Transport
+		switch transportKind {
+		case "tcp":
+			transport = node.NewTCPTransport(vals[i].NodeId(), node.TCPConfig{
+				Listen: addrs[i],
+				Peers:  peerMap,
+			})
+		case "raptorcast":
+			transport = newRCTransport(t, vals, addrs, udpAddrs, authAddrs, i)
+		}
 
 		logPaths[i] = filepath.Join(dir, "node.log")
 		logFile, _ := os.Create(logPaths[i])
@@ -241,4 +271,65 @@ func waitAppHeight(t *testing.T, apps []*bridge.App, target int64, timeout time.
 		}
 	}
 	t.Fatalf("apps never all reached height %d:\n%s", target, b.String())
+}
+
+// newRCTransport — in-process RaptorCast wiring mirroring cmd/monadbft-node's
+// raptorcastTransportOrDie: signed name records, all peers as bootstrap
+// records, epoch-1 validator map.
+func newRCTransport(t *testing.T, vals []bridge.Validator, addrs []string, udpAddrs, authAddrs []netip.AddrPort, i int) node.Transport {
+	t.Helper()
+	self := vals[i].NodeId()
+	tcpAddr := netip.MustParseAddrPort(addrs[i])
+
+	records := map[types.NodeId]peerdisc.MonadNameRecord{}
+	epochVals := map[types.Epoch]map[types.NodeId]struct{}{1: {}}
+	for j := range vals {
+		id := vals[j].NodeId()
+		epochVals[1][id] = struct{}{}
+		if j == i {
+			continue
+		}
+		records[id] = peerdisc.NewMonadNameRecord(
+			peerdisc.NewNameRecordWithPorts(
+				netip.MustParseAddrPort(addrs[j]).Addr(),
+				tcpAddrFrom(t, addrs[j]), udpAddrs[j].Port(), authAddrs[j].Port(), 0, 0, 1),
+			vals[j].Secp)
+	}
+	tr, err := node.NewRaptorcastTransport(node.RaptorcastTransportConfig{
+		SelfID:   self,
+		Key:      vals[i].Secp,
+		AuthUDP:  authAddrs[i],
+		PlainUDP: udpAddrs[i],
+		TCPAddr:  tcpAddr,
+		PeerDisc: peerdisc.PeerDiscoveryBuilder{
+			SelfID:          self,
+			SelfRecord:      peerdisc.NewMonadNameRecord(peerdisc.NewNameRecordWithPorts(tcpAddr.Addr(), tcpAddr.Port(), udpAddrs[i].Port(), authAddrs[i].Port(), 0, 0, 1), vals[i].Secp),
+			CurrentEpoch:    1,
+			EpochValidators: epochVals,
+			BootstrapPeers:  records,
+			// upstream devnet node.toml values
+			RefreshPeriod:                   120 * time.Second,
+			RequestTimeout:                  5 * time.Second,
+			UnresponsivePruneThreshold:      5,
+			LastParticipationPruneThreshold: types.Round(5000),
+			MinNumPeers:                     0,
+			MaxNumPeers:                     200,
+			MaxGroupSize:                    10,
+			PingRateLimitPerSecond:          100,
+			RngSeed:                         uint64(i)*2654435761 + 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRaptorcastTransport %d: %v", i, err)
+	}
+	return tr
+}
+
+func tcpAddrFrom(t *testing.T, a string) uint16 {
+	t.Helper()
+	ap, err := netip.ParseAddrPort(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ap.Port()
 }
