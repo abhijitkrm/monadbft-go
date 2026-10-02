@@ -74,12 +74,14 @@ func (n *Node) execCommands(cmds []glue.Command) {
 	if n.exec.Ledger != nil {
 		n.exec.Ledger.Exec(g.Ledger)
 	}
+	n.crashAt(CrashAfterLedger, n.curEv)
 	if n.exec.TxPool != nil {
 		n.exec.TxPool.Exec(g.TxPool)
 	}
 	if n.configFile != nil {
 		n.configFile.Exec(g.ConfigFile)
 	}
+	n.crashAt(CrashAfterConfigFile, n.curEv)
 	if n.exec.ValSet != nil {
 		n.exec.ValSet.Exec(g.ValSet)
 	}
@@ -99,6 +101,7 @@ func (n *Node) execCommands(cmds []glue.Command) {
 	}
 
 	n.execRouter(g.Router)
+	n.crashAt(CrashAfterPublish, n.curEv)
 
 	if n.exec.ControlPanel != nil {
 		n.exec.ControlPanel.Exec(g.ControlPanel)

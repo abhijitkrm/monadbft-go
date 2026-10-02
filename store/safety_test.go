@@ -86,3 +86,70 @@ func TestSafetyMergeMonotone(t *testing.T) {
 		t.Fatal("merge should pull lower state up (reversed)")
 	}
 }
+
+// TestSafetyRestoreRefusesResign — the CometBFT CheckHRS analogue: a Safety
+// rebuilt from durable watermarks must refuse to re-vote/re-propose a round
+// it already signed, while still allowing the next round.
+func TestSafetyRestoreRefusesResign(t *testing.T) {
+	neTip := mkTip(t, 2, 6).BlockHeader.GetId()
+
+	s := consensus.DefaultSafety()
+	s.Propose(4)                    // proposed round 4
+	s.Vote(5, nil, *mkTip(t, 1, 5)) // voted round 5
+	s.NoEndorse(6, neTip)           // NE'd round 6 against neTip
+	snap := s.Snapshot()
+
+	// Process death: only the snapshot survives.
+	restored := consensus.SafetyFromSnapshot(snap)
+
+	if restored.IsSafeToVote(5, nil) {
+		t.Fatal("restored Safety must refuse re-vote at signed round")
+	}
+	if restored.IsSafeToPropose(4) {
+		t.Fatal("restored Safety must refuse re-propose at signed round")
+	}
+	if restored.IsSafeToNoEndorse(6) {
+		t.Fatal("restored Safety must refuse re-NE at signed round")
+	}
+	// The NE rule survives restore: at the NE'd round a vote is allowed only
+	// when the proposal carries the NE'd tip — nil or a different tip is
+	// refused (round == highestNoEndorse.round is the gated case).
+	if restored.IsSafeToVote(6, nil) {
+		t.Fatal("vote at NE'd round must require the NE'd tip")
+	}
+	if other := mkTip(t, 9, 6).BlockHeader.GetId(); restored.IsSafeToVote(6, &other) {
+		t.Fatal("vote at NE'd round must refuse a different tip")
+	}
+	if !restored.IsSafeToVote(6, &neTip) {
+		t.Fatal("vote at NE'd round must allow the NE'd tip")
+	}
+	if !restored.IsSafeToVote(7, nil) {
+		t.Fatal("the NE gate applies only at the NE'd round — 7 must be free")
+	}
+
+	// A conflicting sign attempt must panic — the watermark is the guard.
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("re-vote at signed round must panic")
+		}
+	}()
+	restored.Vote(5, nil, *mkTip(t, 4, 5))
+}
+
+// TestSafetyRoundPersistence — a watermark written between Update and the
+// wire send must be on disk (fsync'd) and reload identically.
+func TestSafetyRoundPersistence(t *testing.T) {
+	dir := t.TempDir()
+	s := consensus.DefaultSafety()
+	s.Vote(5, nil, *mkTip(t, 1, 5))
+	if err := WriteSafety(dir, s.Snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSafety(dir, exec.Mock)
+	if err != nil || got == nil {
+		t.Fatalf("reload: %v %v", got, err)
+	}
+	if got.HighestVote != 5 {
+		t.Fatalf("highestVote = %d, want 5", got.HighestVote)
+	}
+}

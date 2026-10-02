@@ -76,6 +76,9 @@ type Config struct {
 	StatesyncExpandToGroup bool
 	ServeStatesync         bool
 
+	// Crash — test-only fault injection; see CrashHook. Nil in production.
+	Crash CrashHook
+
 	Logger *slog.Logger
 }
 
@@ -95,8 +98,13 @@ type Node struct {
 	mu      sync.Mutex
 	started bool
 	stopped bool
+	crashed bool
 	fatal   error
 	done    chan struct{}
+
+	// curEv — the event mid-dispatch on the loop goroutine; consulted by
+	// crashAt inside execCommands so a mid-dispatch crash knows its event.
+	curEv glue.MonadEvent
 }
 
 // Open builds a node: opens persistence, constructs MonadState from the
@@ -334,11 +342,19 @@ func (n *Node) handle(ev glue.MonadEvent) {
 			go n.Stop()
 		}
 	}()
+	n.crashAt(CrashBeforeWAL, ev)
 	if err := n.persist.logEvent(ev); err != nil {
 		panic(fmt.Sprintf("wal append: %v", err))
 	}
+	n.crashAt(CrashAfterWAL, ev)
 	cmds := n.state.Update(ev)
+	n.curEv = ev
+	n.crashAt(CrashAfterUpdate, ev)
+	// Durability ordering (CometBFT saveSigned): the safety watermarks
+	// guarding any vote/propose this Update produced must be on disk before
+	// the corresponding publish can reach the wire in execCommands.
 	n.persistSafety()
+	n.crashAt(CrashAfterSafety, ev)
 	n.execCommands(cmds)
 }
 

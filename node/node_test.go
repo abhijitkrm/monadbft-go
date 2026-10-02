@@ -30,6 +30,12 @@ func testConsensusConfig(execDelay types.SeqNum) *consensusstate.Config {
 // Returns the node and its (freshly created) InMemoryState — kept by the
 // caller across restarts since it models the app's durable execution state.
 func openTestNode(t *testing.T, dir string, i int, gv swarm.GenesisValidators, sr *swarm.InMemoryState, transport Transport, execDelay types.SeqNum) (*Node, *swarm.MockLedger) {
+	return openTestNodeCrash(t, dir, i, gv, sr, transport, execDelay, nil)
+}
+
+// openTestNodeCrash — openTestNode with a CrashHook armed (nil for the
+// plain path).
+func openTestNodeCrash(t *testing.T, dir string, i int, gv swarm.GenesisValidators, sr *swarm.InMemoryState, transport Transport, execDelay types.SeqNum, crash CrashHook) (*Node, *swarm.MockLedger) {
 	t.Helper()
 	persist, err := OpenPersistence(dir, exec.Mock, false, true)
 	if err != nil {
@@ -48,6 +54,7 @@ func openTestNode(t *testing.T, dir string, i int, gv swarm.GenesisValidators, s
 		BlockPolicy:       blocktree.PassthruBlockPolicy{},
 		StateRead:         sr,
 		GenesisValidators: gv.ValidatorData,
+		Crash:             crash,
 		Executors: Executors{
 			Ledger:    ledger,
 			TxPool:    swarm.NewMockTxPoolExecutor(),
