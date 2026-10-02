@@ -31,11 +31,30 @@ type TxPool struct {
 	wake     func()
 	// diagnostic: count of forwarded-tx batches received from peers
 	fwdBatches atomic.Int64
+
+	// baseFee triple stamped into proposals (chain params; SetFeeParams
+	// overrides the devnet defaults used by tests).
+	baseFee       uint64
+	baseFeeTrend  uint64
+	baseFeeMoment uint64
 }
 
 var _ swarm.TxPool = (*TxPool)(nil)
 
-func NewTxPool(app *App) *TxPool { return &TxPool{app: app} }
+func NewTxPool(app *App) *TxPool {
+	return &TxPool{
+		app:           app,
+		baseFee:       swarm.MinBaseFee,
+		baseFeeTrend:  swarm.GenesisBaseFeeTrend,
+		baseFeeMoment: swarm.GenesisBaseFeeMoment,
+	}
+}
+
+// SetFeeParams — the proposal base-fee stamp (must match the chain's
+// EvmBlockPolicy expectations or proposals get rejected).
+func (t *TxPool) SetFeeParams(baseFee, trend, moment uint64) {
+	t.baseFee, t.baseFeeTrend, t.baseFeeMoment = baseFee, trend, moment
+}
 
 // SetWakeFunc — node.WakeProducer: SendTransaction enqueues ForwardTxs
 // events outside the exec loop.
@@ -109,9 +128,9 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 		TimestampNs:    c.TimestampNs,
 		RoundSignature: c.RoundSignature,
 
-		BaseFee:       swarm.MinBaseFee,
-		BaseFeeTrend:  swarm.GenesisBaseFeeTrend,
-		BaseFeeMoment: swarm.GenesisBaseFeeMoment,
+		BaseFee:       t.baseFee,
+		BaseFeeTrend:  t.baseFeeTrend,
+		BaseFeeMoment: t.baseFeeMoment,
 
 		DelayedExecutionResults: c.DelayedExecutionResults,
 		ProposedExecutionInputs: glue.ProposedExecutionInputs{

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -236,6 +237,13 @@ func Open(cfg Config) (*Node, error) {
 	return n, nil
 }
 
+// IsRunning — true once started until Stop.
+func (n *Node) IsRunning() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.started && !n.stopped
+}
+
 // Start launches the transport, timestamp feed, and the event loop.
 func (n *Node) Start(ctx context.Context) error {
 	n.mu.Lock()
@@ -335,7 +343,8 @@ func (n *Node) loop() {
 func (n *Node) handle(ev glue.MonadEvent) {
 	defer func() {
 		if r := recover(); r != nil {
-			n.log.Error("consensus panic — shutting down", "event", fmt.Sprintf("%T", ev), "panic", r)
+			n.log.Error("consensus panic — shutting down", "event", fmt.Sprintf("%T", ev), "panic", r,
+				"stack", string(debug.Stack()))
 			n.mu.Lock()
 			n.fatal = fmt.Errorf("consensus panic on %T: %v", ev, r)
 			n.mu.Unlock()

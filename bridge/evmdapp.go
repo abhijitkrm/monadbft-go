@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	abci "github.com/cometbft/cometbft/abci/types"
@@ -47,11 +48,14 @@ func GenesisSenderKey() *ethsecp256k1.PrivKey {
 	return &ethsecp256k1.PrivKey{Key: seed[:]}
 }
 
-// NewEvmdApp constructs an evmd app on an in-memory DB and InitChains it with
-// a validator set + funding account — the same genesis shape as
-// evmd.SetupWithGenesisValSet. Returns the bridge App wrapper (valset
-// bookkeeping installed) and the raw app for test inspection.
-func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
+// evmdGlobalMu serializes app construction: x/vm genesis mutates
+// process-global EVM/SDK config, so concurrent NewExampleApp calls race.
+var evmdGlobalMu sync.Mutex
+
+// newRawEvmd constructs an uninitialized in-memory evmd app.
+func newRawEvmd(cfg EvmdConfig) *evmd.EVMD {
+	evmdGlobalMu.Lock()
+	defer evmdGlobalMu.Unlock()
 	// same option set as evmd's test harness (NewAppOptionsWithFlagHomeAndChainID)
 	appOptions := simtestutil.AppOptionsMap{
 		flags.FlagHome:                              cfg.Home,
@@ -60,11 +64,15 @@ func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
 		srvflags.EVMMempoolInsertQueueSize:          5000,
 		srvflags.EVMMempoolPendingTxProposalTimeout: "250ms",
 	}
-	evmApp := evmd.NewExampleApp(
+	return evmd.NewExampleApp(
 		log.NewNopLogger(), dbm.NewMemDB(), true, appOptions,
 		baseapp.SetChainID(cfg.ChainID),
 	)
+}
 
+// evmdGenesisState builds the genesis doc app-state for the given validator
+// set + funded sender — the same shape as evmd.SetupWithGenesisValSet.
+func evmdGenesisState(evmApp *evmd.EVMD, cfg EvmdConfig, vals []Validator) ([]byte, error) {
 	genesisState := evmApp.DefaultGenesis()
 
 	// one funded genesis account (the delegator for all validators) —
@@ -86,7 +94,7 @@ func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
 		[]authtypes.GenesisAccount{acc}, balance,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("genesis valset: %w", err)
+		return nil, fmt.Errorf("genesis valset: %w", err)
 	}
 
 	// evmd genesis fixups (same as evmd.SetupWithGenesisValSet)
@@ -135,7 +143,16 @@ func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
 	}
 	genesisState[slashingtypes.ModuleName] = evmApp.AppCodec().MustMarshalJSON(&slashingGenesis)
 
-	stateBytes, err := json.Marshal(genesisState)
+	return json.Marshal(genesisState)
+}
+
+// NewEvmdApp constructs an evmd app on an in-memory DB and InitChains it with
+// a validator set + funding account — the same genesis shape as
+// evmd.SetupWithGenesisValSet. Returns the bridge App wrapper (valset
+// bookkeeping installed) and the raw app for test inspection.
+func NewEvmdApp(cfg EvmdConfig, vals []Validator) (*App, *evmd.EVMD, error) {
+	evmApp := newRawEvmd(cfg)
+	stateBytes, err := evmdGenesisState(evmApp, cfg, vals)
 	if err != nil {
 		return nil, nil, err
 	}

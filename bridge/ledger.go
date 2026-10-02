@@ -13,6 +13,7 @@ import (
 	"github.com/abhijitkrm/monadbft-go/blocksync"
 	"github.com/abhijitkrm/monadbft-go/cstypes"
 	"github.com/abhijitkrm/monadbft-go/glue"
+	"github.com/abhijitkrm/monadbft-go/store"
 	"github.com/abhijitkrm/monadbft-go/swarm"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
@@ -44,6 +45,13 @@ type Ledger struct {
 	pendingSpec map[types.BlockId]*cstypes.ConsensusFullBlock
 
 	events []glue.MonadEvent // queued EvBlockSyncSelfResponse
+
+	bs *store.BlockStore // durable block persistence; nil until AttachBlockStore
+
+	// commitHook — optional per-commit callback (engine event publication).
+	// Runs after l.mu is released (the hook reads back through the ledger).
+	commitHook   func(seq int64)
+	pendingHooks []int64
 }
 
 var _ swarm.Ledger = (*Ledger)(nil)
@@ -58,18 +66,78 @@ func NewLedger(app *App, spec *SpecApp) *Ledger {
 	}
 }
 
+// AttachBlockStore wires durable persistence: persists every observed block
+// and the finalized index, and rebuilds the in-memory block maps from what
+// was persisted (restart path). Call before the node starts.
+func (l *Ledger) AttachBlockStore(bs *store.BlockStore) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.bs = bs
+	all, err := bs.AllBlocks()
+	if err != nil {
+		return fmt.Errorf("bridge: load blocks: %w", err)
+	}
+	for _, b := range all {
+		l.blocks[b.GetId()] = b
+	}
+	fin, err := bs.FinalizedBlocks()
+	if err != nil {
+		return fmt.Errorf("bridge: load finalized: %w", err)
+	}
+	for _, b := range fin {
+		l.blocks[b.GetId()] = b
+		l.committed[b.GetSeqNum()] = b
+	}
+	// The app's result index records the exact winner per committed height
+	// (written post-app-commit); prefer it over the fin/ index, which a
+	// crash can leave one commit behind.
+	for h := int64(1); h <= l.app.committedHeight(); h++ {
+		if _, bid, _, _, _, _, ok := l.app.CommittedEntry(h); ok {
+			if b := l.blocks[bid]; b != nil {
+				l.committed[b.GetSeqNum()] = b
+			}
+		}
+	}
+	return nil
+}
+
+// SetCommitHook registers the per-commit callback (engine event bus).
+func (l *Ledger) SetCommitHook(fn func(seq int64)) { l.commitHook = fn }
+
+// persistBlock — durable write of an observed block (idempotent on id).
+// A failed write means a later finalized commit can reference a lost
+// ancestor — unrecoverable, so it's fatal.
+func (l *Ledger) persistBlock(b *cstypes.ConsensusFullBlock) {
+	if l.bs == nil {
+		return
+	}
+	id := b.GetId()
+	if err := l.bs.PutBlock(b); err != nil {
+		panic(fmt.Sprintf("bridge: persist block %x seq %d: %v",
+			id[:8], b.GetSeqNum(), err))
+	}
+}
+
 // Exec — LedgerCommand dispatch (mirrors MockLedger, Finalized executes).
 func (l *Ledger) Exec(cmds []glue.LedgerCommand) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.execLocked(cmds)
+	l.mu.Unlock()
+	l.runCommitHooks()
+}
+
+func (l *Ledger) execLocked(cmds []glue.LedgerCommand) {
 	for _, cmd := range cmds {
 		switch c := cmd.(type) {
 		case glue.LedgerCommit:
 			switch c.Commit.Kind {
 			case glue.CommitProposed, glue.CommitVoted:
 				l.blocks[c.Commit.Block.GetId()] = c.Commit.Block
+				l.persistBlock(c.Commit.Block)
 				l.speculate(c.Commit.Block)
 			case glue.CommitFinalized:
+				l.blocks[c.Commit.Block.GetId()] = c.Commit.Block
+				l.persistBlock(c.Commit.Block)
 				l.commitFinalized(c.Commit.Block)
 			}
 		case glue.LedgerFetchHeaders:
@@ -87,7 +155,6 @@ func (l *Ledger) Exec(cmds []glue.LedgerCommand) {
 // commitFinalized — on a Finalized commit, commit the block and any
 // still-uncommitted ancestors in seq order through the app.
 func (l *Ledger) commitFinalized(block *cstypes.ConsensusFullBlock) {
-	l.blocks[block.GetId()] = block
 
 	// collect the uncommitted tail (walk parents until already-committed)
 	var pending []*cstypes.ConsensusFullBlock
@@ -275,7 +342,15 @@ func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []by
 		valUpdates: updates,
 	})
 	l.committed[h.SeqNum] = block
-	if err := l.app.applyUpdates(updates); err != nil {
+	if l.commitHook != nil {
+		l.pendingHooks = append(l.pendingHooks, int64(h.SeqNum.Uint64()))
+	}
+	if l.bs != nil {
+		if err := l.bs.PutFinalized(h.SeqNum, h.GetId()); err != nil {
+			panic(fmt.Sprintf("bridge: persist finalized %d: %v", h.SeqNum, err))
+		}
+	}
+	if err := l.app.applyUpdates(int64(h.SeqNum.Uint64()), updates); err != nil {
 		panic(err)
 	}
 }
@@ -287,7 +362,12 @@ func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []by
 // frontier is re-anchored wholesale via SpecApp.ResetToHeight at DoneSync.
 func (l *Ledger) applySyncedBlock(block *cstypes.ConsensusFullBlock) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.applySyncedBlockLocked(block)
+	l.mu.Unlock()
+	l.runCommitHooks()
+}
+
+func (l *Ledger) applySyncedBlockLocked(block *cstypes.ConsensusFullBlock) {
 	seq := int64(block.GetSeqNum().Uint64())
 	if seq <= l.app.committedHeight() {
 		return
@@ -399,3 +479,16 @@ func (l *Ledger) GetFinalizedBlocks() []swarm.FinalizedBlock {
 }
 
 func (l *Ledger) FinalizedBlocksLen() int { return len(l.committed) }
+
+// runCommitHooks — drain queued commit seqs and invoke the hook outside
+// l.mu (the hook calls back into ledger/app read paths).
+func (l *Ledger) runCommitHooks() {
+	l.mu.Lock()
+	hooks := l.pendingHooks
+	l.pendingHooks = nil
+	hook := l.commitHook
+	l.mu.Unlock()
+	for _, seq := range hooks {
+		hook(seq)
+	}
+}

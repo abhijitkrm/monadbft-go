@@ -23,33 +23,50 @@ import (
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
-// Validator — one validator's full key material across both stacks:
-// the MonadBFT consensus keys (secp256k1 NodeId + BLS cert key) and the
-// app-side consensus key (ed25519, what the SDK validator set carries).
+// Validator — one validator's key material across both stacks: the MonadBFT
+// consensus keys (secp256k1 NodeId + BLS cert key) and the app-side consensus
+// key (ed25519, what the SDK validator set carries). Pubkey fields are always
+// populated; the private halves are only set for the local node (from the
+// monad key file) or test keys.
 //
 // Until x/consensuskeys exists, the cons-key ↔ consensus-key binding is
-// established by the testnet genesis tooling rather than on-chain.
+// established by the validator binding file (or testnet genesis tooling),
+// not on-chain.
 type Validator struct {
+	SecpPub  crypto.SecpPubKey
+	BlsPub   [48]byte
+	ConsPub  cmted25519.PubKey
 	Secp     *crypto.SecpKeyPair
 	Bls      *crypto.BlsKeyPair
 	ConsPriv cmted25519.PrivKey
 }
 
+// NewValidator — full key material (local node / tests).
+func NewValidator(secp *crypto.SecpKeyPair, bls *crypto.BlsKeyPair, cons cmted25519.PrivKey) Validator {
+	v := Validator{Secp: secp, Bls: bls, ConsPriv: cons}
+	v.SecpPub = secp.PubKey()
+	copy(v.BlsPub[:], bls.PubKey().Compress())
+	v.ConsPub = cmted25519.PubKey(cons.PubKey().Bytes())
+	return v
+}
+
+// PubValidator — a peer validator's public key material (validator binding
+// file); no private keys.
+func PubValidator(secpPub crypto.SecpPubKey, blsPub [48]byte, consPub cmted25519.PubKey) Validator {
+	return Validator{SecpPub: secpPub, BlsPub: blsPub, ConsPub: consPub}
+}
+
 // NodeId — the MonadBFT node identity (secp256k1 pubkey).
-func (v *Validator) NodeId() types.NodeId { return types.NewNodeId(v.Secp.PubKey()) }
+func (v *Validator) NodeId() types.NodeId { return types.NewNodeId(v.SecpPub) }
 
 // ConsAddr — the SDK consensus address (sha256(pubkey)[:20] for ed25519).
-func (v *Validator) ConsAddr() []byte { return v.ConsPriv.PubKey().Address() }
+func (v *Validator) ConsAddr() []byte { return v.ConsPub.Address() }
 
 // ConsPubKey — the cometbft pubkey carried in ValidatorUpdates.
-func (v *Validator) ConsPubKey() cmtcrypto.PubKey { return v.ConsPriv.PubKey() }
+func (v *Validator) ConsPubKey() cmtcrypto.PubKey { return v.ConsPub }
 
 // CertPubKey — the BLS cert pubkey (compressed, 48B).
-func (v *Validator) CertPubKey() [48]byte {
-	var pk [48]byte
-	copy(pk[:], v.Bls.PubKey().Compress())
-	return pk
-}
+func (v *Validator) CertPubKey() [48]byte { return v.BlsPub }
 
 // MakeValidators — deterministic per-index key material, mirroring the
 // swarm's CreateKeysWithValidators for the MonadBFT keys and deriving the
@@ -57,10 +74,10 @@ func (v *Validator) CertPubKey() [48]byte {
 func MakeValidators(n int) []Validator {
 	vals := make([]Validator, n)
 	for i := range vals {
-		vals[i].Secp = testutil.GetKey(uint64(i))
-		vals[i].Bls = testutil.GetCertKey(uint64(i))
 		seed := sha256.Sum256([]byte(fmt.Sprintf("bridge-cons-key-%d", i)))
-		vals[i].ConsPriv = cmted25519.GenPrivKeyFromSecret(seed[:])
+		vals[i] = NewValidator(testutil.GetKey(uint64(i)),
+			testutil.GetCertKey(uint64(i)),
+			cmted25519.GenPrivKeyFromSecret(seed[:]))
 	}
 	return vals
 }
@@ -98,6 +115,15 @@ type App struct {
 	height  int64                 // last committed height
 	results map[int64]resultEntry // committed height → execution result
 	txIndex map[string]int64      // tmhash hex → committed height (RPC /tx)
+	store   *ResultStore          // durable index; nil until AttachStore
+
+	chainID    string
+	consParams *cmtproto.ConsensusParams
+	// valSets — per-height canonical app validator set *after* that height's
+	// updates (the set validating h is valSets[h-1]; genesis set is
+	// valSets[0]). Entries alias when a height carried no updates.
+	valSets    map[int64]*cmttypes.ValidatorSet
+	lastValSet *cmttypes.ValidatorSet
 
 	// opMu serializes store-touching ABCI calls. With SpecApp's async
 	// worker, FinalizeBlock+Commit run off the node loop while
@@ -129,6 +155,7 @@ func NewApp(app abcitypes.Application, vals []Validator) *App {
 		byCons:    map[string]int{},
 		results:   map[int64]resultEntry{},
 		txIndex:   map[string]int64{},
+		valSets:   map[int64]*cmttypes.ValidatorSet{},
 	}
 	for i := range monadVals {
 		a.byCons[string(monadVals[i].ConsAddr())] = i
@@ -146,7 +173,9 @@ func (a *App) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) er
 	if err != nil {
 		return fmt.Errorf("InitChain: %w", err)
 	}
-	if err := a.applyUpdates(res.Validators); err != nil {
+	a.chainID = req.ChainId
+	a.consParams = req.ConsensusParams
+	if err := a.applyUpdates(0, res.Validators); err != nil {
 		return err
 	}
 	a.mu.Lock()
@@ -155,12 +184,18 @@ func (a *App) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) er
 		header:  &EvmFinalizedHeader{Number: 0, AppHash: res.AppHash},
 		blockID: types.GENESIS_BLOCK_ID,
 	}
+	if a.store != nil {
+		if err := a.store.PutGenesis(req.ChainId, req.ConsensusParams, a.appSet); err != nil {
+			return fmt.Errorf("bridge: persist genesis meta: %w", err)
+		}
+	}
 	return nil
 }
 
 // applyUpdates folds ValidatorUpdates into the canonical set via cometbft's
-// UpdateWithChangeSet (power 0 removes, known pubkey updates power).
-func (a *App) applyUpdates(updates []abcitypes.ValidatorUpdate) error {
+// UpdateWithChangeSet (power 0 removes, known pubkey updates power) and
+// records the post-update set under h (it validates h+1).
+func (a *App) applyUpdates(h int64, updates []abcitypes.ValidatorUpdate) error {
 	changes := make([]*cmttypes.Validator, 0, len(updates))
 	for _, u := range updates {
 		pk, err := cryptoenc.PubKeyFromProto(u.PubKey)
@@ -177,12 +212,29 @@ func (a *App) applyUpdates(updates []abcitypes.ValidatorUpdate) error {
 			}
 		}
 		a.appSet = cmttypes.NewValidatorSet(pos)
-		return nil
-	}
-	if err := a.appSet.UpdateWithChangeSet(changes); err != nil {
+	} else if err := a.appSet.UpdateWithChangeSet(changes); err != nil {
 		return fmt.Errorf("bridge: apply validator updates: %w", err)
 	}
+	a.mu.Lock()
+	if len(updates) > 0 || a.lastValSet == nil {
+		a.lastValSet = a.appSet.Copy()
+	}
+	a.valSets[h] = a.lastValSet
+	a.mu.Unlock()
+	a.persistValSet()
 	return nil
+}
+
+// persistValSet write-throughs the canonical set (AttachStore must precede
+// the first commit for restart-safe valset recovery).
+func (a *App) persistValSet() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.store != nil && a.appSet != nil {
+		if err := a.store.SaveValSet(a.appSet); err != nil {
+			panic(fmt.Sprintf("bridge: persist valset: %v", err))
+		}
+	}
 }
 
 // FinalizeBlock — ABCI FinalizeBlock passthrough.
@@ -197,6 +249,10 @@ func (a *App) Commit(ctx context.Context) error {
 	_, err := a.app.Commit(ctx, &abcitypes.RequestCommit{})
 	return err
 }
+
+// SetRaw binds the concrete evmd app (engine path — NewEvmdApp sets it
+// inline for tests). Needed for store-level access (SpecApp, block height).
+func (a *App) SetRaw(r *evmd.EVMD) { a.raw = r }
 
 // Raw — the concrete evmd app when built via NewEvmdApp (nil for other
 // ABCI apps). SpecApp needs it for CommitMultiStore rollback.
@@ -246,10 +302,84 @@ func (a *App) Txs(h int64) [][]byte {
 	return nil
 }
 
+// AttachStore opens the durable result index and rebuilds committed-height
+// bookkeeping (tip, results, tx index, canonical valset). On a fresh store
+// this is a no-op. Call before the node starts committing blocks.
+func (a *App) AttachStore(s *ResultStore) error {
+	tip, res, txIdx, vs, err := s.Load()
+	if err != nil {
+		return fmt.Errorf("bridge: load result store: %w", err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.store = s
+	for h, e := range res {
+		a.results[h] = e
+	}
+	for k, v := range txIdx {
+		a.txIndex[k] = v
+	}
+	if tip > a.height {
+		a.height = tip
+	}
+	if vs != nil {
+		a.appSet = vs
+	}
+	g, err := s.LoadGenesis()
+	if err != nil {
+		return fmt.Errorf("bridge: load genesis meta: %w", err)
+	}
+	if g != nil {
+		a.chainID = g.chainID
+		a.consParams = g.consParams
+	}
+	// rebuild per-height valsets: genesis set + replay stored updates
+	cur := vs
+	if g != nil && g.valSet != nil {
+		cur = g.valSet
+	}
+	if cur != nil {
+		a.valSets[0] = cur
+		for h := int64(1); h <= tip; h++ {
+			if e, ok := res[h]; ok && len(e.valUpdates) > 0 {
+				next, err := applyValUpdates(cur, e.valUpdates)
+				if err != nil {
+					return fmt.Errorf("bridge: replay valset @%d: %w", h, err)
+				}
+				cur = next
+			}
+			a.valSets[h] = cur
+		}
+		a.lastValSet = cur
+	}
+	return nil
+}
+
+// applyValUpdates — UpdateWithChangeSet on a copy (replay helper).
+func applyValUpdates(vs *cmttypes.ValidatorSet, updates []abcitypes.ValidatorUpdate) (*cmttypes.ValidatorSet, error) {
+	changes := make([]*cmttypes.Validator, 0, len(updates))
+	for _, u := range updates {
+		pk, err := cryptoenc.PubKeyFromProto(u.PubKey)
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, cmttypes.NewValidator(pk, u.Power))
+	}
+	cp := vs.Copy()
+	return cp, cp.UpdateWithChangeSet(changes)
+}
+
 // recordCommit — ledger-facing write of the committed height + result.
+// Durably writes through to the result store when attached — a failed write
+// means committed state would be lost on crash, which is unrecoverable.
 func (a *App) recordCommit(seq int64, entry resultEntry) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.store != nil {
+		if err := a.store.Put(seq, entry); err != nil {
+			panic(fmt.Sprintf("bridge: persist committed result %d: %v", seq, err))
+		}
+	}
 	a.height = seq
 	a.results[seq] = entry
 	for _, tx := range entry.txs {
@@ -276,6 +406,26 @@ func (a *App) CommittedEntry(h int64) (header *EvmFinalizedHeader, blockID types
 	}
 	return e.header, e.blockID, e.txs, e.txResults, e.events, e.valUpdates, true
 }
+
+// ValSetAt — the canonical validator set that validated height h
+// (valSets[h-1]); genesis set for h<=1, latest for h>tip.
+func (a *App) ValSetAt(h int64) *cmttypes.ValidatorSet {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if h <= 1 {
+		return a.valSets[0]
+	}
+	if vs, ok := a.valSets[h-1]; ok {
+		return vs
+	}
+	return a.lastValSet
+}
+
+// ChainID / ConsensusParams — captured at InitChain (persisted via
+// ResultStore so restarts recover them).
+func (a *App) ChainID() string { return a.chainID }
+
+func (a *App) ConsensusParams() *cmtproto.ConsensusParams { return a.consParams }
 
 // Validators — the current canonical app-side validator set.
 func (a *App) Validators() []*cmttypes.Validator {
