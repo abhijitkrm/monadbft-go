@@ -29,6 +29,12 @@ const sourceSymbolsMin = 1
 // RFC 5053 section 5.1.2: Kmax = 8192.
 const sourceSymbolsMax = 8192
 
+// Exported for packet-validation bounds (Rust monad_raptor::SOURCE_SYMBOLS_*).
+const (
+	SourceSymbolsMin = sourceSymbolsMin
+	SourceSymbolsMax = sourceSymbolsMax
+)
+
 const xMin, xMax = 4, 129
 
 // determineX: smallest positive integer X with X*(X-1) >= 2*K.
