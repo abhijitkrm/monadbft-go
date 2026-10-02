@@ -54,7 +54,7 @@ func probeWaitHeight(t *testing.T, me *monadEngine, h int64, d time.Duration) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	st := me.node.State()
+	st := me.curNode().State()
 	var round uint64
 	if cs := st.Consensus(); cs != nil && cs.Consensus != nil {
 		round = uint64(cs.Consensus.GetCurrentRound())
@@ -65,7 +65,7 @@ func probeWaitHeight(t *testing.T, me *monadEngine, h int64, d time.Duration) {
 	}
 	var mbuf strings.Builder
 	rec := httptest.NewRecorder()
-	metrics.PrometheusHandler(me.node.Metrics()).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	metrics.PrometheusHandler(me.curNode().Metrics()).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
 	mbuf.WriteString(rec.Body.String())
 	var nonzero []string
 	for _, ln := range strings.Split(mbuf.String(), "\n") {
@@ -74,8 +74,13 @@ func probeWaitHeight(t *testing.T, me *monadEngine, h int64, d time.Duration) {
 		}
 		nonzero = append(nonzero, ln)
 	}
-	t.Fatalf("height %d not reached in %s: appH=%d storeH=%d specTip=%d committed=%d round=%d err=%v\n%s",
-		h, d, me.app.Height(), me.app.StoreTip(), specTip, me.ledger.FinalizedBlocksLen(), round, me.node.Err(),
+	var treeSize, rootSeq int
+	if cs := st.Consensus(); cs != nil && cs.Consensus != nil && cs.Consensus.PendingBlockTree != nil {
+		treeSize = cs.Consensus.PendingBlockTree.Size()
+		rootSeq = int(cs.Consensus.PendingBlockTree.RootSeqNum())
+	}
+	t.Fatalf("height %d not reached in %s: appH=%d storeH=%d specTip=%d committed=%d round=%d tree=%d rootSeq=%d err=%v\n%s",
+		h, d, me.app.Height(), me.app.StoreTip(), specTip, me.ledger.FinalizedBlocksLen(), round, treeSize, rootSeq, me.curNode().Err(),
 		strings.Join(nonzero, "\n"))
 }
 

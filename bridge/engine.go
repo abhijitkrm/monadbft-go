@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -87,14 +89,27 @@ func DefaultEngineConfig() EngineConfig {
 }
 
 type monadEngine struct {
+	// nodeMu guards node/persist — supervise swaps them across the
+	// live→statesync restart; the swap happens under the lock so Stop can
+	// never miss a half-built node.
+	nodeMu  sync.Mutex
 	node    *node.Node
 	persist *node.Persistence
-	rs      *ResultStore
-	ledger  *Ledger
-	spec    *SpecApp
-	app     *App
-	bus     *cmttypes.EventBus
-	client  *Client
+	nodeErr error // last node exit error (informational)
+
+	// openNode rebuilds the consensus node end-to-end: fresh persistence,
+	// re-attached ledger, fresh transport. Called by Start and again by
+	// supervise on each statesync restart.
+	openNode func() (*node.Node, *node.Persistence, error)
+	supDone  chan struct{} // closed when supervise exits
+	stopCh   chan struct{} // closed by stop — suppresses restarts
+
+	rs     *ResultStore
+	ledger *Ledger
+	spec   *SpecApp
+	app    *App
+	bus    *cmttypes.EventBus
+	client *Client
 
 	stopOnce sync.Once
 }
@@ -103,7 +118,67 @@ var _ engine.Engine = (*monadEngine)(nil)
 
 func (e *monadEngine) Client() rpcclient.Client     { return e.client }
 func (e *monadEngine) EventBus() *cmttypes.EventBus { return e.bus }
-func (e *monadEngine) IsRunning() bool              { return e.node != nil && e.node.IsRunning() }
+
+// curNode — the live consensus node handle; nil during a restart window.
+func (e *monadEngine) curNode() *node.Node {
+	e.nodeMu.Lock()
+	defer e.nodeMu.Unlock()
+	return e.node
+}
+
+func (e *monadEngine) IsRunning() bool {
+	n := e.curNode()
+	return n != nil && n.IsRunning()
+}
+
+// supervise — the in-process operator for the live→statesync transition.
+// Rust aborts the node on the maybe_statesync panic and relies on an
+// external restart into statesync; here the panic path persists
+// statesync-target.rlp first, so supervise just rebuilds the node — the
+// next boot re-roots the forkpoint at the observed tip, blocksyncs the
+// ancestry, drives the statesync executor, and goes live near the tip.
+func (e *monadEngine) supervise() {
+	defer close(e.supDone)
+	for {
+		cur := e.curNode()
+		if cur == nil {
+			return
+		}
+		err := cur.Wait()
+		if !errors.Is(err, node.ErrNeedStatesync) {
+			e.nodeMu.Lock()
+			e.nodeErr = err
+			e.nodeMu.Unlock()
+			return
+		}
+		nn, persist, rerr := e.openNode()
+		if rerr != nil {
+			e.nodeMu.Lock()
+			e.nodeErr = rerr
+			e.nodeMu.Unlock()
+			return
+		}
+		e.nodeMu.Lock()
+		select {
+		case <-e.stopCh:
+			e.nodeMu.Unlock()
+			nn.Stop()
+			return
+		default:
+		}
+		if err := nn.Start(context.Background()); err != nil {
+			e.nodeMu.Unlock()
+			e.nodeMu.Lock()
+			e.nodeErr = err
+			e.nodeMu.Unlock()
+			nn.Stop()
+			return
+		}
+		e.node, e.persist = nn, persist
+		e.nodeMu.Unlock()
+		slog.Info("restarted node into statesync", "engine", "monadbft")
+	}
+}
 
 func (e *monadEngine) Stop() error {
 	var err error
@@ -112,8 +187,15 @@ func (e *monadEngine) Stop() error {
 }
 
 func (e *monadEngine) stop() error {
-	// node.Stop owns persist.Close (the node loop closes it on drain).
-	e.node.Stop()
+	close(e.stopCh)
+	e.nodeMu.Lock()
+	n := e.node
+	e.nodeMu.Unlock()
+	if n != nil {
+		// node.Stop owns persist.Close (the node loop closes it on drain).
+		n.Stop()
+	}
+	<-e.supDone
 	// Drain canonical commits before closing spec: the commit worker may
 	// still consult the spec index (CommittedResult) for its tail.
 	if e.ledger != nil {
@@ -228,23 +310,12 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	}
 	self := findSelf(vals, selfID)
 
-	// executors
+	// executors — engine-scoped; they survive the supervised statesync
+	// restart (the ledger's block index and the app's result index are the
+	// durable state the restarted node re-attaches to).
 	dataDir := filepath.Join(root, "data", "monadbft")
-	persist, err := node.OpenPersistence(dataDir, Evm, true, true)
-	if err != nil {
-		return nil, err
-	}
 	spec := NewAsyncSpecApp(bapp)
 	ledger := NewLedger(bapp, spec)
-	cp, err := store.LoadCheckpoint(dataDir, Evm)
-	if err != nil {
-		persist.Close()
-		return nil, fmt.Errorf("forkpoint: %w", err)
-	}
-	if err := ledger.AttachBlockStore(persist.Blocks, cp); err != nil {
-		persist.Close()
-		return nil, fmt.Errorf("blockstore: %w", err)
-	}
 	pool := NewTxPool(bapp)
 	pool.SetFeeParams(cfg.BaseFee, 0, 0)
 	epochLen := types.SeqNum(cfg.EpochLength)
@@ -252,12 +323,6 @@ func Start(opts engine.Options) (engine.Engine, error) {
 		epochLen = types.SeqNum(^uint64(0)) // boundary never reached
 	}
 	valsetExec, err := NewValSet(bapp, epochLen)
-	if err != nil {
-		return nil, err
-	}
-	statesyncExec := NewStateSync(bapp, ledger, spec)
-
-	transport, err := buildTransport(cfg, selfID, secp, vsd, root, dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -272,48 +337,83 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	} else {
 		copy(beneficiary[:], self.ConsAddr())
 	}
-
 	delay := types.SeqNum(cfg.ExecutionDelay)
 	maxU64 := ^uint64(0)
-	n, err := node.Open(node.Config{
-		Dir:         dataDir,
-		Protocol:    Evm,
-		Persistence: persist,
-		Keypair:     secp,
-		CertKeypair: bls,
-		Beneficiary: beneficiary,
-		ConsensusConfig: &consensusstate.Config{
-			ExecutionDelay: delay,
-			Delta:          time.Duration(cfg.DeltaMs) * time.Millisecond,
-			ChainConfig: chaincfg.StaticConfig{
-				P:                 swarm.DefaultChainParams(),
-				EpochLength:       epochLen,
-				EpochStartDelay:   types.Round(maxU64),
-				StakingActivation: types.Epoch(maxU64),
-			},
-			StatesyncToLiveThreshold:   types.SeqNum(cfg.StatesyncThreshold),
-			LiveToStatesyncThreshold:   types.SeqNum(cfg.StatesyncThreshold * 3 / 2),
-			StartExecutionThreshold:    types.SeqNum(cfg.StatesyncThreshold / 2),
-			TimestampLatencyEstimateNs: types.U128FromUint64(10_000_000),
-		},
-		BlockValidator:         blocktree.MockValidator{},
-		BlockPolicy:            blocktree.NewEvmBlockPolicy(delay, cfg.BaseFee, 0, 0),
-		StateRead:              NewStateRead(bapp, spec),
-		GenesisValidators:      vsd,
-		StatesyncExpandToGroup: true,
-		ServeStatesync:         true,
-		Executors: node.Executors{
-			Ledger:    ledger,
-			TxPool:    pool,
-			ValSet:    valsetExec,
-			StateSync: statesyncExec,
-			Transport: transport,
-		},
-		SyncWAL: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("monadbft node: %w", err)
+
+	eng := &monadEngine{
+		rs: rs, ledger: ledger, spec: spec, app: bapp,
+		supDone: make(chan struct{}), stopCh: make(chan struct{}),
 	}
+	eng.openNode = func() (*node.Node, *node.Persistence, error) {
+		persist, err := node.OpenPersistence(dataDir, Evm, true, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		cp, err := store.LoadCheckpoint(dataDir, Evm)
+		if err != nil {
+			persist.Close()
+			return nil, nil, fmt.Errorf("forkpoint: %w", err)
+		}
+		if err := ledger.AttachBlockStore(persist.Blocks, cp); err != nil {
+			persist.Close()
+			return nil, nil, fmt.Errorf("blockstore: %w", err)
+		}
+		transport, err := buildTransport(cfg, selfID, secp, vsd, root, dataDir)
+		if err != nil {
+			persist.Close()
+			return nil, nil, err
+		}
+		// The statesync executor is session-scoped — startedExecution and the
+		// in-flight sync belong to a single consensus boot, not the engine.
+		statesyncExec := NewStateSync(bapp, ledger, spec)
+		n, err := node.Open(node.Config{
+			Dir:         dataDir,
+			Protocol:    Evm,
+			Persistence: persist,
+			Keypair:     secp,
+			CertKeypair: bls,
+			Beneficiary: beneficiary,
+			ConsensusConfig: &consensusstate.Config{
+				ExecutionDelay: delay,
+				Delta:          time.Duration(cfg.DeltaMs) * time.Millisecond,
+				ChainConfig: chaincfg.StaticConfig{
+					P:                 swarm.DefaultChainParams(),
+					EpochLength:       epochLen,
+					EpochStartDelay:   types.Round(maxU64),
+					StakingActivation: types.Epoch(maxU64),
+				},
+				StatesyncToLiveThreshold:   types.SeqNum(cfg.StatesyncThreshold),
+				LiveToStatesyncThreshold:   types.SeqNum(cfg.StatesyncThreshold * 3 / 2),
+				StartExecutionThreshold:    types.SeqNum(cfg.StatesyncThreshold / 2),
+				TimestampLatencyEstimateNs: types.U128FromUint64(10_000_000),
+			},
+			BlockValidator:         blocktree.MockValidator{},
+			BlockPolicy:            blocktree.NewEvmBlockPolicy(delay, cfg.BaseFee, 0, 0),
+			StateRead:              NewStateRead(bapp, spec),
+			GenesisValidators:      vsd,
+			StatesyncExpandToGroup: true,
+			ServeStatesync:         true,
+			Executors: node.Executors{
+				Ledger:    ledger,
+				TxPool:    pool,
+				ValSet:    valsetExec,
+				StateSync: statesyncExec,
+				Transport: transport,
+			},
+			SyncWAL: true,
+		})
+		if err != nil {
+			persist.Close()
+			return nil, nil, fmt.Errorf("monadbft node: %w", err)
+		}
+		return n, persist, nil
+	}
+
+	n, persist, err := eng.openNode()
+	if err != nil {
+		return nil, err
+	}
+	eng.node, eng.persist = n, persist
 	if err := n.Start(context.Background()); err != nil {
 		return nil, fmt.Errorf("monadbft start: %w", err)
 	}
@@ -322,15 +422,19 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	if err := bus.Start(); err != nil {
 		return nil, err
 	}
-	eng := &monadEngine{node: n, persist: persist, rs: rs, ledger: ledger, spec: spec, app: bapp, bus: bus}
+	eng.bus = bus
 	ledger.SetCommitHook(eng.publishCommit)
 
 	client := NewClient(bapp, ledger, pool, bus, genDoc,
-		func() bool { return n.State().IsStatesyncing() }, self)
+		func() bool {
+			cur := eng.curNode()
+			return cur != nil && cur.State().IsStatesyncing()
+		}, self)
 	if err := client.Start(); err != nil {
 		return nil, err
 	}
 	eng.client = client
+	go eng.supervise()
 	return eng, nil
 }
 
