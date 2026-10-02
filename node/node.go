@@ -342,6 +342,15 @@ func (n *Node) handle(ev glue.MonadEvent) {
 			go n.Stop()
 		}
 	}()
+	switch ev.(type) {
+	case glue.EvBlockSyncRequest, glue.EvBlockSyncTimeout,
+		glue.EvBlockSyncSelfRequest, glue.EvBlockSyncSelfCancelRequest,
+		glue.EvBlockSyncResponse, glue.EvBlockSyncSelfResponse,
+		glue.EvConsensusBlockSync, glue.EvStateSyncInbound,
+		glue.EvStateSyncOutbound, glue.EvStateSyncDoneSync,
+		glue.EvStateSyncBlockSync, glue.EvStateSyncRequestSync:
+		n.log.Debug("sync event", "type", fmt.Sprintf("%T", ev), "ev", fmt.Sprintf("%+v", ev))
+	}
 	n.crashAt(CrashBeforeWAL, ev)
 	if err := n.persist.logEvent(ev); err != nil {
 		panic(fmt.Sprintf("wal append: %v", err))
