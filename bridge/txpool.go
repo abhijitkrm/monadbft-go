@@ -3,6 +3,8 @@ package bridge
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
@@ -20,14 +22,24 @@ import (
 //   - BlockCommit/EnterRound/Reset → nop (the mempool's own hooks run inside
 //     FinalizeBlock)
 type TxPool struct {
-	app      *App
+	app *App
+	// mu guards events+lastErrs: SendTransaction is called from outside the
+	// node loop (RPC submission); Ready/Next/Exec run on the loop.
+	mu       sync.Mutex
 	events   []glue.MonadEvent
 	lastErrs []error
+	wake     func()
+	// diagnostic: count of forwarded-tx batches received from peers
+	fwdBatches atomic.Int64
 }
 
 var _ swarm.TxPool = (*TxPool)(nil)
 
 func NewTxPool(app *App) *TxPool { return &TxPool{app: app} }
+
+// SetWakeFunc — node.WakeProducer: SendTransaction enqueues ForwardTxs
+// events outside the exec loop.
+func (t *TxPool) SetWakeFunc(f func()) { t.wake = f }
 
 func (t *TxPool) Exec(cmds []glue.TxPoolCommand) {
 	for _, cmd := range cmds {
@@ -35,6 +47,7 @@ func (t *TxPool) Exec(cmds []glue.TxPoolCommand) {
 		case glue.TxPoolCreateProposal:
 			t.createProposal(c)
 		case glue.TxPoolInsertForwardedTxs:
+			t.fwdBatches.Add(1)
 			t.insertTxs(c.Txs)
 		case glue.TxPoolBlockCommit, glue.TxPoolReset, glue.TxPoolEnterRound:
 			// nop — mempool lifecycle hooks run inside the app's
@@ -79,6 +92,7 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 		res.Txs = res.Txs[:c.TxLimit]
 	}
 
+	t.mu.Lock()
 	t.events = append(t.events, glue.EvMempoolProposal{
 		Epoch:          c.Epoch,
 		Round:          c.Round,
@@ -100,42 +114,104 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 		LastRoundTC:              c.LastRoundTC,
 		FreshProposalCertificate: c.FreshProposalCertificate,
 	})
+	t.mu.Unlock()
 }
 
-// insertTxs — CheckTx + InsertTx (the app-side mempool insert path).
+// insertTxs — CheckTx + InsertTx; returns the txs that landed in the pool.
 // Failures are captured in lastErrs for diagnostics (and dropped otherwise —
-// the mempool legitimately rejects txs).
-func (t *TxPool) insertTxs(txs [][]byte) {
+// the mempool legitimately rejects txs). Caller must not hold mu.
+func (t *TxPool) insertTxs(txs [][]byte) [][]byte {
 	ctx := context.Background()
+	var inserted [][]byte
 	for _, tx := range txs {
 		res, err := t.app.app.CheckTx(ctx, &abcitypes.RequestCheckTx{
 			Tx:   tx,
 			Type: abcitypes.CheckTxType_New,
 		})
 		if err != nil {
-			t.lastErrs = append(t.lastErrs, fmt.Errorf("CheckTx: %w", err))
+			t.errf("CheckTx: %v", err)
 			continue
 		}
 		if res.Code != 0 {
-			t.lastErrs = append(t.lastErrs, fmt.Errorf("CheckTx code=%d: %s", res.Code, res.Log))
+			t.errf("CheckTx code=%d: %s", res.Code, res.Log)
 			continue
 		}
 		if _, err := t.app.app.InsertTx(ctx, &abcitypes.RequestInsertTx{Tx: tx}); err != nil {
-			t.lastErrs = append(t.lastErrs, fmt.Errorf("InsertTx: %w", err))
+			t.errf("InsertTx: %v", err)
 			continue
 		}
+		inserted = append(inserted, tx)
 	}
+	return inserted
+}
+
+func (t *TxPool) errf(format string, args ...any) {
+	t.mu.Lock()
+	t.lastErrs = append(t.lastErrs, fmt.Errorf(format, args...))
+	t.mu.Unlock()
 }
 
 // LastErrs — recent CheckTx/InsertTx failures (test diagnostics).
-func (t *TxPool) LastErrs() []error { return t.lastErrs }
+func (t *TxPool) LastErrs() []error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]error(nil), t.lastErrs...)
+}
 
-// SendTransaction — swarm.TxPool: inject a tx into the mempool.
-func (t *TxPool) SendTransaction(tx []byte) { t.insertTxs([][]byte{tx}) }
+// ForwardedBatches — count of peer-forwarded tx batches ingested.
+func (t *TxPool) ForwardedBatches() int { return int(t.fwdBatches.Load()) }
 
-func (t *TxPool) Ready() bool { return len(t.events) > 0 }
+// Forwarding caps — upstream: MAX_FORWARDED_TXS_PER_MESSAGE and
+// egress_max_size_bytes = 2*max_code_size + 128KiB (evmd default
+// MaxCodeSize = 24KiB).
+const (
+	maxForwardedTxsPerMessage = 5000
+	maxForwardBatchBytes      = 2*24_576 + 128*1024
+)
+
+// SendTransaction — swarm.TxPool: inject a tx into the mempool, then queue
+// EvMempoolForwardTxs batches for the upcoming leaders (upstream: owned
+// txs are owned+forwardable; forwarded txs are never re-forwarded).
+func (t *TxPool) SendTransaction(tx []byte) {
+	inserted := t.insertTxs([][]byte{tx})
+	if len(inserted) == 0 {
+		return
+	}
+	var batch [][]byte
+	batchBytes := 0
+	flush := func() {
+		if len(batch) > 0 {
+			t.events = append(t.events, glue.EvMempoolForwardTxs{Txs: batch})
+			batch, batchBytes = nil, 0
+		}
+	}
+	for _, tx := range inserted {
+		if len(tx) > maxForwardBatchBytes {
+			continue // upstream logs + drops oversized
+		}
+		if len(batch) == maxForwardedTxsPerMessage || batchBytes+len(tx) > maxForwardBatchBytes {
+			flush()
+		}
+		batch = append(batch, tx)
+		batchBytes += len(tx)
+	}
+	t.mu.Lock()
+	flush()
+	t.mu.Unlock()
+	if t.wake != nil {
+		t.wake()
+	}
+}
+
+func (t *TxPool) Ready() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.events) > 0
+}
 
 func (t *TxPool) Next() glue.MonadEvent {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if len(t.events) == 0 {
 		return nil
 	}

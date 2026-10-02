@@ -83,6 +83,7 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 	apps := make([]*bridge.App, numNodes)
 	raws := make([]*evmd.EVMD, numNodes)
 	nodes := make([]*node.Node, numNodes)
+	pools := make([]*bridge.TxPool, numNodes)
 	logPaths := make([]string, numNodes)
 
 	// Genesis validator set — identical on every node (same vals table).
@@ -155,7 +156,7 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 			GenesisValidators:      genesisVals,
 			Executors: node.Executors{
 				Ledger:    bridge.NewLedger(app),
-				TxPool:    bridge.NewTxPool(app),
+				TxPool:    newPoolBridge(app, &pools[i]),
 				ValSet:    valset,
 				StateSync: bridge.NopStateSync{},
 				Transport: transport,
@@ -183,8 +184,9 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 
 	waitAppHeight(t, apps, 4, 60*time.Second, logPaths)
 
-	// Inject a real signed EVM transfer into node 0's mempool; it should be
-	// reaped into a proposal and finalized on every node.
+	// Inject a real signed EVM transfer into the LAST node's mempool; the
+	// ForwardTxs leader-forwarding path carries it to upcoming leaders, where
+	// it gets reaped into a proposal and finalized on every node.
 	sender := bridge.GenesisSenderKey()
 	from := common.BytesToAddress(sender.PubKey().Address().Bytes())
 	to := common.HexToAddress("0x000000000000000000000000000000000000dEaD")
@@ -209,7 +211,7 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 	}
 	wantHash := msg.Hash()
 
-	nodes[0].SendTransaction(txBytes)
+	nodes[numNodes-1].SendTransaction(txBytes)
 
 	deadline := time.Now().Add(90 * time.Second)
 	found := false
@@ -236,6 +238,17 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 	if !found {
 		t.Fatalf("tx %s never included (reached height %d)", wantHash, apps[0].Height())
 	}
+	// The submitter never re-forwards: at least one *other* node must have
+	// received the forwarded batch for inclusion to have happened via a
+	// different leader.
+	fwd := 0
+	for i := 0; i < numNodes-1; i++ {
+		fwd += pools[i].ForwardedBatches()
+	}
+	if fwd == 0 {
+		t.Fatal("tx included but no peer saw a forwarded batch — leader-forwarding broken")
+	}
+	t.Logf("forwarded batches received by peers: %d", fwd)
 
 	waitAppHeight(t, apps, 10, 60*time.Second, logPaths)
 	assertSameChain(t, apps, 10)
@@ -332,4 +345,12 @@ func tcpAddrFrom(t *testing.T, a string) uint16 {
 		t.Fatal(err)
 	}
 	return ap.Port()
+}
+
+// newPoolBridge — retain a handle to the pool so the test can assert on
+// forwarding counters.
+func newPoolBridge(app *bridge.App, out **bridge.TxPool) *bridge.TxPool {
+	p := bridge.NewTxPool(app)
+	*out = p
+	return p
 }
