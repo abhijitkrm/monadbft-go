@@ -102,11 +102,10 @@ func (l *Ledger) commitFinalized(block *cstypes.ConsensusFullBlock) {
 func (l *Ledger) finalizeOne(block *cstypes.ConsensusFullBlock) {
 	h := block.Header
 	seq := int64(h.SeqNum.Uint64())
-	if seq <= l.app.height {
+	if height := l.app.committedHeight(); seq <= height {
 		return // already committed (e.g. re-emit after restart)
-	}
-	if l.app.height != 0 && seq != l.app.height+1 {
-		panic(fmt.Sprintf("bridge: finalize height %d after %d — gaps", seq, l.app.height))
+	} else if height != 0 && seq != height+1 {
+		panic(fmt.Sprintf("bridge: finalize height %d after %d — gaps", seq, height))
 	}
 
 	body, ok := block.Body.Inner.ExecutionBody.(*EvmBody)
@@ -131,12 +130,11 @@ func (l *Ledger) finalizeOne(block *cstypes.ConsensusFullBlock) {
 		panic(fmt.Sprintf("bridge: Commit h=%d: %v", seq, err))
 	}
 
-	l.app.height = seq
-	l.app.results[seq] = resultEntry{
+	l.app.recordCommit(seq, resultEntry{
 		header:  &EvmFinalizedHeader{Number: h.SeqNum, AppHash: res.AppHash},
 		blockID: h.GetId(),
 		txs:     body.Txs,
-	}
+	})
 	l.committed[h.SeqNum] = block
 	if err := l.app.applyUpdates(res.ValidatorUpdates); err != nil {
 		panic(err)

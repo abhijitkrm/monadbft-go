@@ -24,7 +24,9 @@ func NewStateRead(app *App) *StateRead { return &StateRead{app: app} }
 func (s *StateRead) GetExecutionResult(
 	blockID types.BlockId, seqNum types.SeqNum, isFinalized bool,
 ) (exec.FinalizedHeader, error) {
+	s.app.mu.Lock()
 	entry, ok := s.app.results[int64(seqNum.Uint64())]
+	s.app.mu.Unlock()
 	if !ok {
 		return nil, blocktree.ErrNotAvailableYet
 	}
@@ -36,6 +38,8 @@ func (s *StateRead) GetExecutionResult(
 
 // RawReadEarliestFinalizedBlock — lowest committed seq (genesis = 0).
 func (s *StateRead) RawReadEarliestFinalizedBlock() *types.SeqNum {
+	s.app.mu.Lock()
+	defer s.app.mu.Unlock()
 	var min *types.SeqNum
 	for seq := range s.app.results {
 		sn := types.SeqNum(seq)
@@ -49,6 +53,8 @@ func (s *StateRead) RawReadEarliestFinalizedBlock() *types.SeqNum {
 
 // RawReadLatestFinalizedBlock — highest committed seq.
 func (s *StateRead) RawReadLatestFinalizedBlock() *types.SeqNum {
+	s.app.mu.Lock()
+	defer s.app.mu.Unlock()
 	var max *types.SeqNum
 	for seq := range s.app.results {
 		sn := types.SeqNum(seq)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sort"
+	"sync"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	cmtcrypto "github.com/cometbft/cometbft/crypto"
@@ -87,6 +88,10 @@ type App struct {
 	appSet    *cmttypes.ValidatorSet // canonical order for VoteInfo
 	byCons    map[string]int         // consAddr → monadVals index
 
+	// mu guards height/results: the swarm drives an App single-threaded, but
+	// under the node runtime the ledger commits on the node's loop goroutine
+	// while tests/RPC read concurrently.
+	mu      sync.Mutex
 	height  int64                 // last committed height
 	results map[int64]resultEntry // committed height → execution result
 }
@@ -129,6 +134,8 @@ func (a *App) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) er
 	if err := a.applyUpdates(res.Validators); err != nil {
 		return err
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.results[0] = resultEntry{
 		header:  &EvmFinalizedHeader{Number: 0, AppHash: res.AppHash},
 		blockID: types.GENESIS_BLOCK_ID,
@@ -177,10 +184,16 @@ func (a *App) Commit(ctx context.Context) error {
 }
 
 // Height — last committed height.
-func (a *App) Height() int64 { return a.height }
+func (a *App) Height() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.height
+}
 
 // Result — the finalized execution result (app hash) committed at height h.
 func (a *App) Result(h int64) *EvmFinalizedHeader {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if e, ok := a.results[h]; ok {
 		return e.header
 	}
@@ -189,10 +202,27 @@ func (a *App) Result(h int64) *EvmFinalizedHeader {
 
 // Txs — the tx list committed at height h (test/assertion seam).
 func (a *App) Txs(h int64) [][]byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if e, ok := a.results[h]; ok {
 		return e.txs
 	}
 	return nil
+}
+
+// recordCommit — ledger-facing write of the committed height + result.
+func (a *App) recordCommit(seq int64, entry resultEntry) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.height = seq
+	a.results[seq] = entry
+}
+
+// committedHeight — ledger-facing read of the last committed height.
+func (a *App) committedHeight() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.height
 }
 
 // LastCommit — the ABCI decided_last_commit for a block being finalized:
