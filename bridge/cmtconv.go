@@ -28,7 +28,9 @@ func (a *App) synthHeader(b *cstypes.ConsensusFullBlock) cmttypes.Header {
 
 	var appHash []byte
 	var lastResultsHash []byte
-	if e, _, _, _, _, _, ok := a.CommittedEntry(seq); ok && e != nil {
+	// CometBFT header convention: AppHash is the commit hash of the PREVIOUS
+	// height (genesis commit at h=1), not this block's post-state.
+	if e, _, _, _, _, _, ok := a.CommittedEntry(seq - 1); ok && e != nil {
 		appHash = e.AppHash
 	}
 	if seq > 1 {
