@@ -141,3 +141,40 @@ func TestForkpointWriteLoad(t *testing.T) {
 }
 
 func ptr(q cstypes.QuorumCertificate) *cstypes.QuorumCertificate { return &q }
+
+// TestAllBlocksFFPrefixedId — regression: blocks whose id begins with 0xff
+// sorted above the old blk/+0xff iterator bound and were silently dropped
+// from AllBlocks. The block persisted (GetBlock by id worked) but never
+// reloaded into the ledger's index, so restart self-blocksync answered
+// NotAvailable forever and consensus stalled on timeout rounds.
+func TestAllBlocksFFPrefixedId(t *testing.T) {
+	dir := t.TempDir()
+	bs, err := OpenBlockStore(dir, exec.Mock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+
+	// search seeds for a block id with a leading 0xff byte
+	var ff *cstypes.ConsensusFullBlock
+	for seed := uint64(0); seed < 1<<16; seed++ {
+		b := mkBlock(t, seed, 1, cstypes.GenesisQC())
+		if b.GetId()[0] == 0xff {
+			ff = &b
+			break
+		}
+	}
+	if ff == nil {
+		t.Skip("no 0xff-prefixed id found in seed search")
+	}
+	if err := bs.PutBlock(ff); err != nil {
+		t.Fatal(err)
+	}
+	all, err := bs.AllBlocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].GetId() != ff.GetId() {
+		t.Fatalf("AllBlocks dropped 0xff-prefixed block: %d entries", len(all))
+	}
+}

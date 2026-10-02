@@ -103,6 +103,15 @@ func (s *BlockStore) get(key []byte) ([]byte, error) {
 	return append([]byte(nil), v...), nil
 }
 
+// prefixUpperBound — the exclusive iterator bound covering every key under
+// prefix: the prefix with its final byte incremented. Appending 0xff would
+// wrongly exclude keys whose payload starts with a 0xff byte.
+func prefixUpperBound(prefix []byte) []byte {
+	ub := append([]byte(nil), prefix...)
+	ub[len(ub)-1]++
+	return ub
+}
+
 // GetBlock — fetch a full block by id; nil if absent.
 func (s *BlockStore) GetBlock(id types.BlockId) (*cstypes.ConsensusFullBlock, error) {
 	v, err := s.get(blkKey(id))
@@ -155,7 +164,7 @@ func (s *BlockStore) GetPayload(pid cstypes.ConsensusBlockBodyId) (*cstypes.Cons
 func (s *BlockStore) AllBlocks() ([]*cstypes.ConsensusFullBlock, error) {
 	it, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: blkPrefix,
-		UpperBound: append(append([]byte(nil), blkPrefix...), 0xff),
+		UpperBound: prefixUpperBound(blkPrefix),
 	})
 	if err != nil {
 		return nil, err
@@ -176,7 +185,7 @@ func (s *BlockStore) AllBlocks() ([]*cstypes.ConsensusFullBlock, error) {
 func (s *BlockStore) FinalizedBlocks() ([]*cstypes.ConsensusFullBlock, error) {
 	it, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: finPrefix,
-		UpperBound: append(append([]byte(nil), finPrefix...), 0xff),
+		UpperBound: prefixUpperBound(finPrefix),
 	})
 	if err != nil {
 		return nil, err
