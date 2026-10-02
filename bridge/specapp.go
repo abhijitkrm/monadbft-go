@@ -48,9 +48,10 @@ type SpecApp struct {
 	// async worker (NewAsyncSpecApp): SpecFinalize submits run off the
 	// caller's goroutine — FinalizeBlock is expensive enough to starve a
 	// consensus loop. Nil jobs channel = synchronous mode.
-	jobs chan specJob
-	stop chan struct{}
-	wg   sync.WaitGroup
+	jobs      chan specJob
+	stop      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 type specJob struct {
@@ -106,13 +107,15 @@ func newSpecApp(app *App, _ bool) *SpecApp {
 }
 
 // Close — stop the async worker (drains pending jobs first, since they're
-// ordered). No-op in sync mode.
+// ordered). Idempotent; no-op in sync mode.
 func (s *SpecApp) Close() {
 	if s.stop == nil {
 		return
 	}
-	close(s.stop)
-	s.wg.Wait()
+	s.closeOnce.Do(func() {
+		close(s.stop)
+		s.wg.Wait()
+	})
 }
 
 func (s *SpecApp) loop() {

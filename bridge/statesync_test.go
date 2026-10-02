@@ -118,6 +118,9 @@ func TestStateSyncReplay(t *testing.T) {
 	srvLedger.Exec([]glue.LedgerCommand{glue.LedgerCommit{
 		Commit: glue.OptimisticCommit{Kind: glue.CommitFinalized, Block: last},
 	}})
+	// Commits run on the ledger's canonical-commit worker — drain before
+	// asserting app state (serving continues read-only afterwards).
+	srvLedger.Close()
 	require.Equal(t, int64(target), srv.Height())
 	want := srv.Result(target)
 	require.NotNil(t, want)

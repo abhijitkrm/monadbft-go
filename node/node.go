@@ -191,6 +191,13 @@ func Open(cfg Config) (*Node, error) {
 		persist.Close()
 		return nil, err
 	}
+	if cp != nil && persist.Blocks != nil {
+		cp, err = sanitizeCheckpoint(cp, persist.Blocks, cfg.Logger)
+		if err != nil {
+			persist.Close()
+			return nil, err
+		}
+	}
 	if cp != nil {
 		forkpoint = monadstate.Forkpoint{Checkpoint: *cp}
 		lockedEpochs = locked
@@ -230,6 +237,14 @@ func Open(cfg Config) (*Node, error) {
 		RestoredSafety:            restored,
 	}.Build()
 	n.state = state
+
+	// Seed the wall clock before init dispatch: the timestamper's first tick
+	// lands ~period after Start, and a proposal built while localTimeNs==0
+	// gets stamped prev+1 (≈1ns) — permanently outside the validity window,
+	// forcing the first round to time out.
+	state.Update(glue.EvTimestampUpdate{
+		Timestamp: types.U128FromUint64(uint64(time.Now().UnixNano())),
+	})
 
 	// Init commands: epoch validator sets to router, timers, maybe-start.
 	n.execCommands(initCmds)

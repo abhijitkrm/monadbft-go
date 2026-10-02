@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
@@ -30,6 +31,7 @@ import (
 	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/net/peerdisc"
 	"github.com/abhijitkrm/monadbft-go/node"
+	"github.com/abhijitkrm/monadbft-go/store"
 	"github.com/abhijitkrm/monadbft-go/swarm"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
@@ -86,9 +88,12 @@ type monadEngine struct {
 	persist *node.Persistence
 	rs      *ResultStore
 	ledger  *Ledger
+	spec    *SpecApp
 	app     *App
 	bus     *cmttypes.EventBus
 	client  *Client
+
+	stopOnce sync.Once
 }
 
 var _ engine.Engine = (*monadEngine)(nil)
@@ -98,8 +103,22 @@ func (e *monadEngine) EventBus() *cmttypes.EventBus { return e.bus }
 func (e *monadEngine) IsRunning() bool              { return e.node != nil && e.node.IsRunning() }
 
 func (e *monadEngine) Stop() error {
+	var err error
+	e.stopOnce.Do(func() { err = e.stop() })
+	return err
+}
+
+func (e *monadEngine) stop() error {
 	// node.Stop owns persist.Close (the node loop closes it on drain).
 	e.node.Stop()
+	// Drain canonical commits before closing spec: the commit worker may
+	// still consult the spec index (CommittedResult) for its tail.
+	if e.ledger != nil {
+		e.ledger.Close()
+	}
+	if e.spec != nil {
+		e.spec.Close()
+	}
 	if e.client != nil && e.client.IsRunning() {
 		_ = e.client.Stop()
 	}
@@ -212,9 +231,14 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	spec := NewSpecApp(bapp)
+	spec := NewAsyncSpecApp(bapp)
 	ledger := NewLedger(bapp, spec)
-	if err := ledger.AttachBlockStore(persist.Blocks); err != nil {
+	cp, err := store.LoadCheckpoint(dataDir, Evm)
+	if err != nil {
+		persist.Close()
+		return nil, fmt.Errorf("forkpoint: %w", err)
+	}
+	if err := ledger.AttachBlockStore(persist.Blocks, cp); err != nil {
 		persist.Close()
 		return nil, fmt.Errorf("blockstore: %w", err)
 	}
@@ -295,7 +319,7 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	if err := bus.Start(); err != nil {
 		return nil, err
 	}
-	eng := &monadEngine{node: n, persist: persist, rs: rs, ledger: ledger, app: bapp, bus: bus}
+	eng := &monadEngine{node: n, persist: persist, rs: rs, ledger: ledger, spec: spec, app: bapp, bus: bus}
 	ledger.SetCommitHook(eng.publishCommit)
 
 	client := NewClient(bapp, ledger, pool, bus, genDoc,

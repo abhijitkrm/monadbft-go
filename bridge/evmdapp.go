@@ -54,9 +54,14 @@ var evmdGlobalMu sync.Mutex
 
 // newRawEvmd constructs an uninitialized in-memory evmd app.
 func newRawEvmd(cfg EvmdConfig) *evmd.EVMD {
+	return newRawEvmdDB(cfg, dbm.NewMemDB())
+}
+
+// newRawEvmdDB — newRawEvmd over a caller-supplied DB (restart tests use a
+// disk-backed store to exercise the reload path).
+func newRawEvmdDB(cfg EvmdConfig, db dbm.DB) *evmd.EVMD {
 	evmdGlobalMu.Lock()
 	defer evmdGlobalMu.Unlock()
-	// same option set as evmd's test harness (NewAppOptionsWithFlagHomeAndChainID)
 	appOptions := simtestutil.AppOptionsMap{
 		flags.FlagHome:                              cfg.Home,
 		server.FlagInvCheckPeriod:                   5,
@@ -65,7 +70,7 @@ func newRawEvmd(cfg EvmdConfig) *evmd.EVMD {
 		srvflags.EVMMempoolPendingTxProposalTimeout: "250ms",
 	}
 	return evmd.NewExampleApp(
-		log.NewNopLogger(), dbm.NewMemDB(), true, appOptions,
+		log.NewNopLogger(), db, true, appOptions,
 		baseapp.SetChainID(cfg.ChainID),
 	)
 }

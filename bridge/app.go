@@ -14,6 +14,7 @@ import (
 	"github.com/cometbft/cometbft/crypto/tmhash"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	cmttypes "github.com/cometbft/cometbft/types"
+	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 	"github.com/cosmos/evm/evmd"
 
 	"github.com/abhijitkrm/monadbft-go/crypto"
@@ -437,11 +438,74 @@ func (a *App) Validators() []*cmttypes.Validator {
 	return append([]*cmttypes.Validator(nil), a.appSet.Validators...)
 }
 
-// committedHeight — ledger-facing read of the last committed height.
+// committedHeight — ledger-facing read of the last committed height. Note
+// this is the index tip, NOT the store tip: spec commits legitimately run
+// the store ahead of canonical, so the store version is never authoritative
+// here.
 func (a *App) committedHeight() int64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.height
+}
+
+// StoreAppHash — the committed app hash at height h from the root
+// multistore's commit info (used for crash-window index backfill).
+func (a *App) StoreAppHash(h int64) []byte {
+	if a.raw == nil {
+		return nil
+	}
+	rms, ok := a.raw.CommitMultiStore().(interface {
+		GetCommitInfo(int64) (*storetypes.CommitInfo, error)
+	})
+	if !ok {
+		return nil
+	}
+	info, err := rms.GetCommitInfo(h)
+	if err != nil || info == nil {
+		return nil
+	}
+	return info.CommitID().Hash
+}
+
+// RollbackTo — delete store versions above target (restart reconciliation:
+// discards a speculative tail or uncheckpointed commits so the store tip
+// returns to the forkpoint root).
+func (a *App) RollbackTo(target int64) error {
+	if a.raw == nil {
+		return fmt.Errorf("bridge: no raw app")
+	}
+	rms, ok := a.raw.CommitMultiStore().(interface {
+		RollbackToVersion(int64) error
+	})
+	if !ok {
+		return fmt.Errorf("bridge: store %T cannot rollback", a.raw.CommitMultiStore())
+	}
+	return rms.RollbackToVersion(target)
+}
+
+// truncateIndex — drop in-memory index entries above tip (an index entry
+// past the forkpoint root recorded a commit that never checkpointed; the
+// durable rows are overwritten when the canonical commit re-lands).
+func (a *App) truncateIndex(tip int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for h := range a.results {
+		if h > tip {
+			delete(a.results, h)
+			delete(a.valSets, h)
+		}
+	}
+	a.height = tip
+}
+
+// fillValSetGap — crash-window backfill: the lost commit's validator
+// updates are unrecoverable without re-execution, so carry the current set
+// forward (a valset change landing exactly in the tail-commit window is
+// not yet supported).
+func (a *App) fillValSetGap(h int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.valSets[h] = a.lastValSet
 }
 
 // LastCommit — the ABCI decided_last_commit for a block being finalized:

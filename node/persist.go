@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 
 	"github.com/abhijitkrm/monadbft-go/consensus"
@@ -134,4 +135,68 @@ func loadPersistedState(dir string, ep *exec.Protocol) (*cstypes.Checkpoint, []g
 		locked = append(locked, s)
 	}
 	return cp, locked, nil
+}
+
+// sanitizeCheckpoint — a crash can leave a checkpoint whose high certificate
+// cites ancestry adopted from received TC/proposal certs that never reached
+// the blockstore (the block only arrives via blocksync, and on a solo or
+// fully-offline restart no peer can serve it). Resuming then deadlocks: the
+// missing-ancestor request is answered only by the local store, forever.
+// Clamp the high certificate to the QC inside the root block's header — the
+// deepest cert whose ancestry is provably local — so consensus resumes on
+// the committed chain. Uncommitted progress is discarded; committed state
+// and safety watermarks are untouched.
+func sanitizeCheckpoint(cp *cstypes.Checkpoint, bs *store.BlockStore, log *slog.Logger) (*cstypes.Checkpoint, error) {
+	if cp.Root == types.GENESIS_BLOCK_ID {
+		return cp, nil
+	}
+	root, err := bs.GetBlock(cp.Root)
+	if err != nil {
+		return nil, fmt.Errorf("node: forkpoint root lookup: %w", err)
+	}
+	if root == nil {
+		return nil, fmt.Errorf("node: forkpoint root %x not in blockstore — "+
+			"committed state is unrecoverable from this data dir", cp.Root[:8])
+	}
+	missing := missingHighCertRefs(cp.HighCertificate, bs)
+	if len(missing) == 0 {
+		return cp, nil
+	}
+	fallback := cstypes.RoundCertFromQC(root.Header.QC)
+	log.Warn("forkpoint high certificate cites unpersisted ancestry; "+
+		"clamping to root's embedded QC",
+		"hc_round", cp.HighCertificate.Round().Uint64(),
+		"missing", fmt.Sprintf("%x", missing[0][:8]),
+		"clamped_round", fallback.Round().Uint64())
+	out := *cp
+	out.HighCertificate = *fallback
+	return &out, nil
+}
+
+// missingHighCertRefs — the block ids the cert's tip chain must resolve:
+// the QC'd block plus, for a fresh-tip high_extend, the tip block itself.
+func missingHighCertRefs(hc cstypes.RoundCertificate, bs *store.BlockStore) []types.BlockId {
+	var refs []types.BlockId
+	if hc.IsQC {
+		if hc.QC != nil {
+			refs = append(refs, hc.QC.GetBlockId())
+		}
+	} else if tc := hc.TC; tc != nil {
+		if he := tc.HighExtend; he.IsTip && he.Tip != nil {
+			refs = append(refs, he.Tip.BlockHeader.GetId(), he.Tip.BlockHeader.QC.GetBlockId())
+		} else if he.QC != nil {
+			refs = append(refs, he.QC.GetBlockId())
+		}
+	}
+	var missing []types.BlockId
+	for _, id := range refs {
+		if id == types.GENESIS_BLOCK_ID {
+			continue
+		}
+		b, err := bs.GetBlock(id)
+		if err != nil || b == nil {
+			missing = append(missing, id)
+		}
+	}
+	return missing
 }

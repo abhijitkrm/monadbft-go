@@ -485,10 +485,17 @@ func (c *Client) ABCIQueryWithOptions(ctx context.Context, path string, data cmt
 	opts rpcclient.ABCIQueryOptions) (*coretypes.ResultABCIQuery, error) {
 	c.app.opMu.Lock()
 	defer c.app.opMu.Unlock()
+	height := opts.Height
+	if height == 0 {
+		// "latest" resolved against the canonical committed tip — not the
+		// store version, which a speculative finalize in flight puts
+		// transiently ahead of any check/finalize ctx header.
+		height = c.app.committedHeight()
+	}
 	res, err := c.app.ABCI().Query(ctx, &abcitypes.RequestQuery{
 		Path:   path,
 		Data:   data,
-		Height: opts.Height,
+		Height: height,
 		Prove:  opts.Prove,
 	})
 	if err != nil {

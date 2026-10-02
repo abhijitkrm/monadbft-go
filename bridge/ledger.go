@@ -52,24 +52,57 @@ type Ledger struct {
 	// Runs after l.mu is released (the hook reads back through the ledger).
 	commitHook   func(seq int64)
 	pendingHooks []int64
+
+	// commitQ feeds the canonical-commit worker: FinalizeBlock+Commit latency
+	// must not serialize inside the node loop or proposal/vote timers starve.
+	// FIFO preserves seq order; l.committed is marked at enqueue so readers
+	// see the consensus-finalized chain even while the app commit is in
+	// flight. close() drains the buffer before the worker exits.
+	commitQ    chan *cstypes.ConsensusFullBlock
+	commitWg   sync.WaitGroup
+	commitOnce sync.Once
+	commitDone chan struct{}
 }
 
 var _ swarm.Ledger = (*Ledger)(nil)
 
 func NewLedger(app *App, spec *SpecApp) *Ledger {
-	return &Ledger{
+	l := &Ledger{
 		app:         app,
 		spec:        spec,
 		blocks:      map[types.BlockId]*cstypes.ConsensusFullBlock{},
 		committed:   map[types.SeqNum]*cstypes.ConsensusFullBlock{},
 		pendingSpec: map[types.BlockId]*cstypes.ConsensusFullBlock{},
+		commitQ:     make(chan *cstypes.ConsensusFullBlock, 1024),
+		commitDone:  make(chan struct{}),
 	}
+	return l
+}
+
+// Close — drain the canonical-commit queue and stop the worker. Callers must
+// guarantee no further Ledger/StateSync Exec calls first (the node loop owns
+// both dispatch paths, so after Node.Stop it is safe).
+func (l *Ledger) Close() {
+	if l.commitQ == nil {
+		return
+	}
+	l.commitOnce.Do(func() {}) // never started → nothing to drain
+	select {
+	case <-l.commitDone:
+		return
+	default:
+	}
+	close(l.commitQ)
+	l.commitWg.Wait()
+	close(l.commitDone)
 }
 
 // AttachBlockStore wires durable persistence: persists every observed block
 // and the finalized index, and rebuilds the in-memory block maps from what
-// was persisted (restart path). Call before the node starts.
-func (l *Ledger) AttachBlockStore(bs *store.BlockStore) error {
+// was persisted (restart path). cp is the persisted forkpoint checkpoint
+// (nil on a fresh chain) — its Root names the canonical committed tip, used
+// to reconcile the crash window between app Commit and index writes.
+func (l *Ledger) AttachBlockStore(bs *store.BlockStore, cp *cstypes.Checkpoint) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.bs = bs
@@ -98,11 +131,98 @@ func (l *Ledger) AttachBlockStore(bs *store.BlockStore) error {
 			}
 		}
 	}
+	l.reconcileStoreTip(cp)
 	return nil
 }
 
+// reconcileStoreTip — restore consistency between three stores after a kill:
+// the app store (which spec commits run ahead), the result index (written
+// post-commit, so it can lag), and the persisted forkpoint checkpoint (the
+// authoritative canonical tip — consensus resumes there).
+//
+//   - store tip above the checkpoint root = speculative tail or
+//     uncheckpointed commits: roll the store back to the root; consensus
+//     re-finalizes anything real.
+//   - checkpoint root above the index tip = tail commits lost to the
+//     recordCommit write window: backfill index/finalized entries walking
+//     the root's ancestry through the block index.
+func (l *Ledger) reconcileStoreTip(cp *cstypes.Checkpoint) {
+	idxTip := l.app.committedHeight()
+	rootSeq := idxTip
+	var rootID types.BlockId
+	if cp != nil {
+		rootID = cp.Root
+		if root := l.blocks[cp.Root]; root != nil {
+			rootSeq = int64(root.GetSeqNum().Uint64())
+		}
+	}
+	if idxTip > rootSeq {
+		l.app.truncateIndex(rootSeq)
+		idxTip = rootSeq
+	}
+	if tip := l.app.StoreTip(); tip > rootSeq && rootSeq > 0 {
+		if err := l.app.RollbackTo(rootSeq); err != nil {
+			panic(fmt.Sprintf("bridge: rollback to forkpoint %d: %v", rootSeq, err))
+		}
+	}
+	// Re-anchor the spec frontier at the canonical tip: restart leaves the
+	// spec index empty and its tip tracking at zero, so without this every
+	// SpecFinalize fails chaining and delayed-execution results never
+	// materialize — consensus stalls proposing.
+	if l.spec != nil && rootSeq > 0 {
+		l.spec.ResetToHeight(rootSeq, rootID)
+	}
+	if rootSeq <= idxTip {
+		return
+	}
+	// Collect the winning blocks for (idxTip, rootSeq] walking back from
+	// the forkpoint root.
+	var gap []*cstypes.ConsensusFullBlock
+	for id := cp.Root; ; {
+		b := l.blocks[id]
+		if b == nil {
+			break
+		}
+		seq := int64(b.GetSeqNum().Uint64())
+		if seq <= idxTip {
+			break
+		}
+		gap = append(gap, b)
+		id = b.Header.GetParentId()
+	}
+	if len(gap) == 0 || int64(gap[0].GetSeqNum().Uint64()) != rootSeq {
+		// Winners unavailable — committedHeight() still reports the index
+		// tip, so the ledger re-finalizes from there and recordCommit
+		// overwrites; only the interim RPC surface is incomplete.
+		return
+	}
+	for i := len(gap) - 1; i >= 0; i-- {
+		b := gap[i]
+		h := b.Header
+		seq := int64(h.SeqNum.Uint64())
+		body, ok := b.Body.Inner.ExecutionBody.(*EvmBody)
+		if !ok {
+			continue
+		}
+		l.app.recordCommit(seq, resultEntry{
+			header:  &EvmFinalizedHeader{Number: h.SeqNum, AppHash: l.app.StoreAppHash(seq)},
+			blockID: h.GetId(),
+			txs:     body.Txs,
+		})
+		l.committed[h.SeqNum] = b
+		l.app.fillValSetGap(seq)
+		if err := l.bs.PutFinalized(h.SeqNum, h.GetId()); err != nil {
+			panic(fmt.Sprintf("bridge: persist reconciled finalized %d: %v", seq, err))
+		}
+	}
+}
+
 // SetCommitHook registers the per-commit callback (engine event bus).
-func (l *Ledger) SetCommitHook(fn func(seq int64)) { l.commitHook = fn }
+func (l *Ledger) SetCommitHook(fn func(seq int64)) {
+	l.mu.Lock()
+	l.commitHook = fn
+	l.mu.Unlock()
+}
 
 // persistBlock — durable write of an observed block (idempotent on id).
 // A failed write means a later finalized commit can reference a lost
@@ -179,12 +299,75 @@ func (l *Ledger) commitFinalized(block *cstypes.ConsensusFullBlock) {
 		}
 		b = par
 	}
-	// commit oldest → newest
+	// enqueue oldest → newest; marking committed at enqueue keeps later
+	// walks from re-queuing and lets self-blocksync/header readers see the
+	// canonical chain while app-commit is still in flight on the worker.
 	for i := len(pending) - 1; i >= 0; i-- {
-		l.finalizeOne(pending[i])
+		b := pending[i]
+		if _, done := l.committed[b.GetSeqNum()]; done {
+			continue
+		}
+		l.committed[b.GetSeqNum()] = b
+		l.commitOnce.Do(func() {
+			l.commitWg.Add(1)
+			go l.commitLoop()
+		})
+		l.commitQ <- b
 	}
-	// canonicalized parents may have unblocked pending spec work
 	l.drainSpec()
+}
+
+// commitLoop — the canonical-commit worker: applies each finalized block to
+// the app (opMu-serialized against the spec worker) and records the result,
+// off the node loop so consensus timers are never blocked by app latency.
+func (l *Ledger) commitLoop() {
+	defer l.commitWg.Done()
+	for b := range l.commitQ {
+		l.execCanonical(b)
+	}
+}
+
+// execCanonical — worker-side apply of one finalized block: spec-result
+// reuse when the spec frontier already executed this exact block, else a
+// direct FinalizeBlock+Commit. Lock discipline: l.mu and app.opMu are never
+// held together — bookkeeping takes l.mu briefly; store commits take opMu.
+func (l *Ledger) execCanonical(block *cstypes.ConsensusFullBlock) {
+	h := block.Header
+	seq := int64(h.SeqNum.Uint64())
+	if seq <= l.app.committedHeight() {
+		return // already applied (restart re-emit or duplicate)
+	}
+	if height := l.app.committedHeight(); height != 0 && seq != height+1 {
+		panic(fmt.Sprintf("bridge: finalize height %d after %d — gaps", seq, height))
+	}
+	body, ok := block.Body.Inner.ExecutionBody.(*EvmBody)
+	if !ok {
+		panic(fmt.Sprintf("bridge: unexpected body type %T", block.Body.Inner.ExecutionBody))
+	}
+	blockID := h.GetId()
+
+	var appHash []byte
+	var updates []abcitypes.ValidatorUpdate
+	var txResults []*abcitypes.ExecTxResult
+	var events []abcitypes.Event
+	if l.spec != nil {
+		l.mu.Lock()
+		parent := l.committedID(seq - 1)
+		l.mu.Unlock()
+		a, u, t, e, hit := l.spec.CommittedResult(seq, blockID,
+			func(int64) types.BlockId { return parent })
+		if hit {
+			appHash, updates, txResults, events = a, u, t, e
+		}
+	}
+	if appHash == nil {
+		appHash, updates, txResults, events = l.finalizeDirect(block, body)
+	}
+	l.mu.Lock()
+	l.recordCommitted(block, appHash, updates, txResults, events)
+	l.drainSpec()
+	l.mu.Unlock()
+	l.runCommitHooks()
 }
 
 // speculate — queue a block for speculative execution and drain the backlog
@@ -275,40 +458,6 @@ func (l *Ledger) finalizeRequest(h cstypes.ConsensusBlockHeader, txs [][]byte) *
 		Hash:               blockID[:],
 		NextValidatorsHash: l.app.ValidatorsHash(),
 	}
-}
-
-// finalizeOne — commit one consensus block through the app: reuse the spec
-// result when this block was already executed (execution-delay pipeline),
-// else FinalizeBlock+Commit synchronously.
-func (l *Ledger) finalizeOne(block *cstypes.ConsensusFullBlock) {
-	h := block.Header
-	seq := int64(h.SeqNum.Uint64())
-	if height := l.app.committedHeight(); seq <= height {
-		return // already committed (e.g. re-emit after restart)
-	} else if height != 0 && seq != height+1 {
-		panic(fmt.Sprintf("bridge: finalize height %d after %d — gaps", seq, height))
-	}
-
-	body, ok := block.Body.Inner.ExecutionBody.(*EvmBody)
-	if !ok {
-		panic(fmt.Sprintf("bridge: unexpected body type %T", block.Body.Inner.ExecutionBody))
-	}
-	blockID := h.GetId()
-
-	var appHash []byte
-	var updates []abcitypes.ValidatorUpdate
-	var txResults []*abcitypes.ExecTxResult
-	var events []abcitypes.Event
-	if l.spec != nil {
-		appHash, updates, txResults, events, ok = l.spec.CommittedResult(seq, blockID, l.committedID)
-		if !ok {
-			appHash = nil
-		}
-	}
-	if appHash == nil {
-		appHash, updates, txResults, events = l.finalizeDirect(block, body)
-	}
-	l.recordCommitted(block, appHash, updates, txResults, events)
 }
 
 // finalizeDirect — synchronous FinalizeBlock+Commit for one block (opMu
@@ -418,6 +567,7 @@ func (l *Ledger) committedSeq() types.SeqNum {
 }
 
 // committedID — the canonical block ID at a committed seq (genesis → zero ID).
+// Callers must hold l.mu.
 func (l *Ledger) committedID(seq int64) types.BlockId {
 	b := l.committed[types.SeqNum(seq)]
 	if b == nil {
@@ -468,8 +618,11 @@ func (l *Ledger) Next() glue.MonadEvent {
 	return ev
 }
 
-// GetFinalizedBlocks / FinalizedBlocksLen — swarm verifier seam.
+// GetFinalizedBlocks / FinalizedBlocksLen — swarm verifier seam. Called
+// from harness goroutines, so read under l.mu like the other accessors.
 func (l *Ledger) GetFinalizedBlocks() []swarm.FinalizedBlock {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	out := make([]swarm.FinalizedBlock, 0, len(l.committed))
 	for seq, b := range l.committed {
 		out = append(out, swarm.FinalizedBlock{SeqNum: seq, Block: b})
@@ -478,7 +631,11 @@ func (l *Ledger) GetFinalizedBlocks() []swarm.FinalizedBlock {
 	return out
 }
 
-func (l *Ledger) FinalizedBlocksLen() int { return len(l.committed) }
+func (l *Ledger) FinalizedBlocksLen() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return len(l.committed)
+}
 
 // runCommitHooks — drain queued commit seqs and invoke the hook outside
 // l.mu (the hook calls back into ledger/app read paths).
