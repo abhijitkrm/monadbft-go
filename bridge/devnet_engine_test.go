@@ -179,10 +179,14 @@ func TestEngineMultiNodeRestartRaptorcast(t *testing.T) {
 	runMultiNodeRestart(t, "raptorcast")
 }
 
-func runMultiNodeRestart(t *testing.T, transport string) {
+// bringUpDevnet — shared 4-validator devnet bring-up: genesis doc with the
+// full valset, per-node dirs/ports, bootstrap peer records, configs, then
+// sequential engine starts. Returns nodes+vals+genDoc for tests that then
+// exercise restart/crash/statesync scenarios.
+func bringUpDevnet(t *testing.T, chainID string, transport string, ssThreshold int) ([]*devnetNode, []Validator, EvmdConfig, *cmttypes.GenesisDoc) {
 	const n = 4
 	vals := MakeValidators(n)
-	cfg := EvmdConfig{ChainID: "probe-devnet", EVMChainID: testconstants.EighteenDecimalsChainID, Home: t.TempDir()}
+	cfg := EvmdConfig{ChainID: chainID, EVMChainID: testconstants.EighteenDecimalsChainID, Home: t.TempDir()}
 
 	// Shared genesis: identical app state + all four cons keys.
 	evmtypes.NewEVMConfigurator().ResetTestConfig()
@@ -222,7 +226,11 @@ func runMultiNodeRestart(t *testing.T, transport string) {
 			uint16(port), uint16(nodes[i].udpPort), uint16(nodes[i].authPort), 0, 0, 1))
 	}
 	for i := range nodes {
-		writeNodeConfig(t, nodes[i], transport, vals[i], vals, peers)
+		if ssThreshold > 0 {
+			writeNodeConfigSS(t, nodes[i], transport, vals[i], vals, peers, uint64(ssThreshold))
+		} else {
+			writeNodeConfig(t, nodes[i], transport, vals[i], vals, peers)
+		}
 	}
 
 	for i := range nodes {
@@ -233,14 +241,24 @@ func runMultiNodeRestart(t *testing.T, transport string) {
 			}
 		})
 	}
-	defer func() {
-		for i, dn := range nodes {
-			if dn.me != nil {
-				id := dn.me.curNode().NodeID()
-				t.Logf("node%d peers=%d id=%x…", i, len(dn.me.curNode().Peers()), id.PubKey[:4])
-			}
+	return nodes, vals, cfg, genDoc
+}
+
+// logPeerCounts — failure-path diag: per-node peer count + id prefix.
+func logPeerCounts(t *testing.T, nodes []*devnetNode) {
+	t.Helper()
+	for i, dn := range nodes {
+		if dn.me != nil {
+			id := dn.me.curNode().NodeID()
+			t.Logf("node%d peers=%d id=%x…", i, len(dn.me.curNode().Peers()), id.PubKey[:4])
 		}
-	}()
+	}
+}
+
+func runMultiNodeRestart(t *testing.T, transport string) {
+	const n = 4
+	nodes, _, cfg, genDoc := bringUpDevnet(t, "probe-devnet", transport, 0)
+	defer logPeerCounts(t, nodes)
 	for i := range nodes {
 		probeWaitHeight(t, nodes[i].me, 4, 60*time.Second)
 	}
@@ -258,6 +276,41 @@ func runMultiNodeRestart(t *testing.T, transport string) {
 	probeWaitHeight(t, nodes[0].me, tip+2, 90*time.Second)
 	for i := range nodes {
 		t.Logf("node %d height=%d", i, nodes[i].me.app.Height())
+	}
+}
+
+// TestEngineMultiNodeCrashWindows — Phase-6 crash matrix at engine scope:
+// kill node 0 at three intra-round points — right after a peer's commit
+// boundary (post-commit), ~500ms in (proposal/vote window), and ~1100ms in
+// (near the next commit) on the ~1.3s devnet cadence — then restart on the
+// same dirs and rejoin, three times over one live devnet. Each kill keeps
+// safety.rlp/WAL/forkpoint, so this exercises resume-from-crash, not
+// statesync.
+func TestEngineMultiNodeCrashWindows(t *testing.T) {
+	const n = 4
+	nodes, _, cfg, genDoc := bringUpDevnet(t, "probe-crashwin", "tcp", 0)
+	defer logPeerCounts(t, nodes)
+	for i := range nodes {
+		probeWaitHeight(t, nodes[i].me, 5, 60*time.Second)
+	}
+
+	for _, off := range []time.Duration{0, 500 * time.Millisecond, 1100 * time.Millisecond} {
+		// Anchor at a fresh commit boundary on a peer, then sleep into the
+		// intra-round offset before the kill.
+		h := nodes[1].me.app.Height()
+		probeWaitHeight(t, nodes[1].me, h+1, 60*time.Second)
+		time.Sleep(off)
+
+		nodes[0].stop(t)
+		for i := 1; i < n; i++ {
+			probeWaitHeight(t, nodes[i].me, nodes[i].me.app.Height()+2, 60*time.Second)
+		}
+		tip := nodes[1].me.app.Height()
+
+		startDevnetNode(t, cfg, nodes[0], genDoc)
+		probeWaitHeight(t, nodes[0].me, tip+1, 90*time.Second)
+		t.Logf("offset=%v: node0 rejoined height=%d tip≈%d peers=%d",
+			off, nodes[0].me.app.Height(), tip, len(nodes[0].me.curNode().Peers()))
 	}
 }
 
@@ -283,63 +336,9 @@ func TestEngineStatesyncRejoin(t *testing.T) {
 
 func testEngineStatesyncRejoin(t *testing.T, wipeSafety bool) {
 	const n = 4
-	vals := MakeValidators(n)
-	cfg := EvmdConfig{ChainID: "probe-statesync", EVMChainID: testconstants.EighteenDecimalsChainID, Home: t.TempDir()}
-
-	evmtypes.NewEVMConfigurator().ResetTestConfig()
-	genesisRaw := newRawEvmdDB(cfg, dbm.NewMemDB())
-	stateBytes, err := evmdGenesisState(genesisRaw, cfg, vals)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var genVals []cmttypes.GenesisValidator
-	for _, v := range vals {
-		pub := cmted25519.PubKey(v.ConsPub)
-		genVals = append(genVals, cmttypes.GenesisValidator{
-			Address: pub.Address(), PubKey: pub, Power: 1, Name: "v",
-		})
-	}
-	genDoc := &cmttypes.GenesisDoc{
-		ChainID:         cfg.ChainID,
-		GenesisTime:     time.Now(),
-		ConsensusParams: cmttypes.DefaultConsensusParams(),
-		Validators:      genVals,
-		AppState:        stateBytes,
-	}
-
-	nodes := make([]*devnetNode, n)
-	var peers []node.BootstrapPeerConfig
-	for i := range nodes {
-		tcp := allocTCP(t)
-		_, portStr, _ := net.SplitHostPort(tcp)
-		port, _ := strconv.Atoi(portStr)
-		nodes[i] = &devnetNode{
-			root: t.TempDir(), appDir: t.TempDir(), tcpAddr: tcp,
-			udpPort: allocUDP(t), authPort: allocUDP(t),
-		}
-		peers = append(peers, node.SelfBootstrapPeer(vals[i].Secp,
-			netip.MustParseAddr("127.0.0.1"),
-			uint16(port), uint16(nodes[i].udpPort), uint16(nodes[i].authPort), 0, 0, 1))
-	}
-	for i := range nodes {
-		// Low threshold: a node >6 behind statesyncs instead of blocksyncing.
-		writeNodeConfigSS(t, nodes[i], "tcp", vals[i], vals, peers, 6)
-	}
-	for i := range nodes {
-		startDevnetNode(t, cfg, nodes[i], genDoc)
-		t.Cleanup(func() {
-			if nodes[i].eng != nil {
-				nodes[i].stop(t)
-			}
-		})
-	}
-	defer func() {
-		for i, dn := range nodes {
-			if dn.me != nil {
-				t.Logf("node%d peers=%d", i, len(dn.me.curNode().Peers()))
-			}
-		}
-	}()
+	// Low threshold: a node >6 behind statesyncs instead of blocksyncing.
+	nodes, _, cfg, genDoc := bringUpDevnet(t, "probe-statesync", "tcp", 6)
+	defer logPeerCounts(t, nodes)
 	for i := range nodes {
 		probeWaitHeight(t, nodes[i].me, 6, 60*time.Second)
 	}
