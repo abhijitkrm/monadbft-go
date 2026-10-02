@@ -181,10 +181,19 @@ func (a *App) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) er
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.results[0] = resultEntry{
+	genesis := resultEntry{
 		header:  &EvmFinalizedHeader{Number: 0, AppHash: res.AppHash},
 		blockID: types.GENESIS_BLOCK_ID,
 	}
+	if a.store != nil {
+		// Persist the genesis result: restart resume wants a finalized
+		// execution result at seq root-delay, which clamps to 0 when the
+		// forkpoint root is below execution_delay.
+		if err := a.store.Put(0, genesis); err != nil {
+			return fmt.Errorf("bridge: persist genesis result: %w", err)
+		}
+	}
+	a.results[0] = genesis
 	if a.store != nil {
 		if err := a.store.PutGenesis(req.ChainId, req.ConsensusParams, a.appSet); err != nil {
 			return fmt.Errorf("bridge: persist genesis meta: %w", err)
