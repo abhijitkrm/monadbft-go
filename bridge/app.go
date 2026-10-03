@@ -116,7 +116,9 @@ type App struct {
 	height  int64                 // last committed height
 	results map[int64]resultEntry // committed height → execution result
 	txIndex map[string]int64      // tmhash hex → committed height (RPC /tx)
+	cmtIdx  map[string]int64      // comet block hash → height (no-store path)
 	store   *ResultStore          // durable index; nil until AttachStore
+	retain  int64                 // in-memory result/valset window; 0 = all
 
 	chainID    string
 	consParams *cmtproto.ConsensusParams
@@ -156,6 +158,7 @@ func NewApp(app abcitypes.Application, vals []Validator) *App {
 		byCons:    map[string]int{},
 		results:   map[int64]resultEntry{},
 		txIndex:   map[string]int64{},
+		cmtIdx:    map[string]int64{},
 		valSets:   map[int64]*cmttypes.ValidatorSet{},
 	}
 	for i := range monadVals {
@@ -232,8 +235,18 @@ func (a *App) applyUpdates(h int64, updates []abcitypes.ValidatorUpdate) error {
 	a.valSets[h] = a.lastValSet
 	a.mu.Unlock()
 	a.persistValSet()
+	if len(updates) > 0 && a.store != nil {
+		if err := a.store.PutValSetChange(h, a.lastValSet); err != nil {
+			return fmt.Errorf("bridge: persist valset change @%d: %w", h, err)
+		}
+	}
 	return nil
 }
+
+// SetRetain — the in-memory results/valsets window (heights below
+// tip-retain are served from the ResultStore on demand). 0 disables pruning
+// (unit tests / unbounded retention).
+func (a *App) SetRetain(n int64) { a.retain = n }
 
 // persistValSet write-throughs the canonical set (AttachStore must precede
 // the first commit for restart-safe valset recovery).
@@ -294,29 +307,40 @@ func (a *App) Height() int64 {
 
 // Result — the finalized execution result (app hash) committed at height h.
 func (a *App) Result(h int64) *EvmFinalizedHeader {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if e, ok := a.results[h]; ok {
-		return e.header
+	hdr, _, _, _, _, _, ok := a.CommittedEntry(h)
+	if !ok {
+		return nil
 	}
-	return nil
+	return hdr
 }
 
 // Txs — the tx list committed at height h (test/assertion seam).
 func (a *App) Txs(h int64) [][]byte {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if e, ok := a.results[h]; ok {
-		return e.txs
+	_, _, txs, _, _, _, ok := a.CommittedEntry(h)
+	if !ok {
+		return nil
 	}
-	return nil
+	return txs
 }
 
 // AttachStore opens the durable result index and rebuilds committed-height
-// bookkeeping (tip, results, tx index, canonical valset). On a fresh store
-// this is a no-op. Call before the node starts committing blocks.
+// bookkeeping: tip, the in-memory results window (last `retain` heights —
+// older entries serve on demand), the canonical valset, and per-height
+// valsets for the window. On a fresh store this is a no-op. Call before the
+// node starts committing blocks.
 func (a *App) AttachStore(s *ResultStore) error {
-	tip, res, txIdx, vs, err := s.Load()
+	tip, err := s.Tip()
+	if err != nil {
+		return fmt.Errorf("bridge: load result store: %w", err)
+	}
+	from := int64(0)
+	if a.retain > 0 && tip > a.retain {
+		from = tip - a.retain + 1
+	}
+	_, res, vs, err := s.LoadRecent(from)
+	if err != nil {
+		return fmt.Errorf("bridge: load result store: %w", err)
+	}
 	if err != nil {
 		return fmt.Errorf("bridge: load result store: %w", err)
 	}
@@ -325,9 +349,6 @@ func (a *App) AttachStore(s *ResultStore) error {
 	a.store = s
 	for h, e := range res {
 		a.results[h] = e
-	}
-	for k, v := range txIdx {
-		a.txIndex[k] = v
 	}
 	if tip > a.height {
 		a.height = tip
@@ -343,14 +364,34 @@ func (a *App) AttachStore(s *ResultStore) error {
 		a.chainID = g.chainID
 		a.consParams = g.consParams
 	}
-	// rebuild per-height valsets: genesis set + replay stored updates
-	cur := vs
-	if g != nil && g.valSet != nil {
-		cur = g.valSet
+	// Rebuild per-height valsets for the retained window: base is the last
+	// persisted change at-or-before the window floor (genesis set otherwise),
+	// then replay in-window updates. Below-floor heights resolve through
+	// ValSetBefore on demand.
+	var gen *cmttypes.ValidatorSet
+	if g != nil {
+		gen = g.valSet
+	}
+	cur := gen
+	if from > 1 {
+		if base, err := s.ValSetBefore(from - 1); err != nil {
+			return fmt.Errorf("bridge: load valset @%d: %w", from-1, err)
+		} else if base != nil {
+			cur = base
+		}
 	}
 	if cur != nil {
-		a.valSets[0] = cur
-		for h := int64(1); h <= tip; h++ {
+		if gen != nil {
+			a.valSets[0] = gen
+		}
+		if from > 0 {
+			a.valSets[from-1] = cur // window base
+		}
+		lo := from
+		if lo < 1 {
+			lo = 1
+		}
+		for h := lo; h <= tip; h++ {
 			if e, ok := res[h]; ok && len(e.valUpdates) > 0 {
 				next, err := applyValUpdates(cur, e.valUpdates)
 				if err != nil {
@@ -380,8 +421,10 @@ func applyValUpdates(vs *cmttypes.ValidatorSet, updates []abcitypes.ValidatorUpd
 }
 
 // recordCommit — ledger-facing write of the committed height + result.
-// Durably writes through to the result store when attached — a failed write
-// means committed state would be lost on crash, which is unrecoverable.
+// Durably writes through to the result store when attached (the same batch
+// carries the tx-hash index) — a failed write means committed state would
+// be lost on crash, which is unrecoverable. Then prunes the in-memory
+// window: heights below tip-retain serve from the store on demand.
 func (a *App) recordCommit(seq int64, entry resultEntry) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -392,25 +435,79 @@ func (a *App) recordCommit(seq int64, entry resultEntry) {
 	}
 	a.height = seq
 	a.results[seq] = entry
-	for _, tx := range entry.txs {
-		a.txIndex[fmt.Sprintf("%X", tmhash.Sum(tx))] = seq
+	if a.store == nil {
+		for _, tx := range entry.txs {
+			a.txIndex[fmt.Sprintf("%X", tmhash.Sum(tx))] = seq
+		}
+	}
+	if a.retain > 0 {
+		floor := seq - a.retain
+		if floor > 0 {
+			delete(a.results, floor)
+			delete(a.valSets, floor)
+		}
 	}
 }
 
 // TxLookup — the height a tx hash committed at (CometBFT tx-hash = tmhash).
 func (a *App) TxLookup(hashHex string) (height int64, ok bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	h, ok := a.txIndex[hashHex]
-	return h, ok
+	if a.store == nil {
+		h, ok := a.txIndex[hashHex]
+		a.mu.Unlock()
+		return h, ok
+	}
+	a.mu.Unlock()
+	h, ok, err := a.store.TxHeight(hashHex)
+	return h, ok && err == nil
 }
 
-// CommittedEntry — the full committed record at height h for RPC serving.
+// RecordCmtHash — index a synthesized comet block hash → height (ledger
+// computes it once per commit; RPC block_by_hash becomes O(1)).
+func (a *App) RecordCmtHash(hash []byte, h int64) {
+	if a.store == nil {
+		a.mu.Lock()
+		a.cmtIdx[string(hash)] = h
+		a.mu.Unlock()
+		return
+	}
+	if err := a.store.PutCmtHash(hash, h); err != nil {
+		panic(fmt.Sprintf("bridge: persist cmt hash @%d: %v", h, err))
+	}
+}
+
+// CmtHeight — height for a synthesized comet block hash; ok=false if the
+// hash predates the index (restarted through a version without it) or is
+// not a committed block.
+func (a *App) CmtHeight(hash []byte) (int64, bool) {
+	a.mu.Lock()
+	if h, ok := a.cmtIdx[string(hash)]; ok {
+		a.mu.Unlock()
+		return h, true
+	}
+	a.mu.Unlock()
+	if a.store == nil {
+		return 0, false
+	}
+	h, ok, err := a.store.CmtHeight(hash)
+	return h, ok && err == nil
+}
+
+// CommittedEntry — the full committed record at height h for RPC serving:
+// in-memory window first, then the durable index (heights below the
+// retention floor).
 func (a *App) CommittedEntry(h int64) (header *EvmFinalizedHeader, blockID types.BlockId, txs [][]byte,
 	txResults []*abcitypes.ExecTxResult, events []abcitypes.Event, updates []abcitypes.ValidatorUpdate, ok bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	e, found := a.results[h]
+	a.mu.Unlock()
+	if !found && a.store != nil {
+		var err error
+		e, found, err = a.store.Get(h)
+		if err != nil {
+			return nil, types.BlockId{}, nil, nil, nil, nil, false
+		}
+	}
 	if !found {
 		return nil, types.BlockId{}, nil, nil, nil, nil, false
 	}
@@ -418,17 +515,32 @@ func (a *App) CommittedEntry(h int64) (header *EvmFinalizedHeader, blockID types
 }
 
 // ValSetAt — the canonical validator set that validated height h
-// (valSets[h-1]); genesis set for h<=1, latest for h>tip.
+// (valSets[h-1]); genesis set for h<=1, latest for h>tip, store change-log
+// for heights below the retained window.
 func (a *App) ValSetAt(h int64) *cmttypes.ValidatorSet {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if h <= 1 {
-		return a.valSets[0]
-	}
-	if vs, ok := a.valSets[h-1]; ok {
+		vs := a.valSets[0]
+		a.mu.Unlock()
 		return vs
 	}
-	return a.lastValSet
+	if vs, ok := a.valSets[h-1]; ok {
+		a.mu.Unlock()
+		return vs
+	}
+	st, below := a.store, a.retain > 0 && h-1 < a.height-a.retain
+	last := a.lastValSet
+	gen := a.valSets[0]
+	a.mu.Unlock()
+	if below && st != nil {
+		if vs, err := st.ValSetBefore(h - 1); err == nil && vs != nil {
+			return vs
+		}
+		if gen != nil {
+			return gen
+		}
+	}
+	return last
 }
 
 // ChainID / ConsensusParams — captured at InitChain (persisted via

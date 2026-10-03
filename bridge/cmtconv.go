@@ -51,8 +51,10 @@ func (a *App) synthHeader(b *cstypes.ConsensusFullBlock) cmttypes.Header {
 	if vs := a.valSetAfter(seq); vs != nil {
 		nextValHash = vs.Hash()
 	}
-	if a.consParams != nil {
-		consHash = cmttypes.ConsensusParamsFromProto(*a.consParams).Hash()
+	// ConsensusParamsFromProto dereferences every sub-message — test genesis
+	// docs can carry nils; skip the hash rather than panic.
+	if p := a.consParams; p != nil && p.Evidence != nil && p.Validator != nil && p.Version != nil {
+		consHash = cmttypes.ConsensusParamsFromProto(*p).Hash()
 	}
 
 	parentID := h.GetParentId()

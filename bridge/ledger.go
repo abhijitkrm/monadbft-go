@@ -37,6 +37,17 @@ type Ledger struct {
 	blocks    map[types.BlockId]*cstypes.ConsensusFullBlock // proposed+voted+finalized
 	committed map[types.SeqNum]*cstypes.ConsensusFullBlock  // finalized, in seq order
 
+	// Block lookup indexes — the maps above are bounded to a retention
+	// window around the committed tip; older seqs resolve through bs.
+	committedByID map[types.BlockId]types.SeqNum   // committed id → seq
+	maxCommitted  types.SeqNum                     // O(1) committedSeq
+	certifiers    map[types.BlockId]certifierEntry // certified id → best QC
+	retain        types.SeqNum                     // mem window; 0 = all
+	pruneKeep     types.SeqNum                     // disk retention; 0 = all
+
+	// lastPrune — last tip the disk pruner ran at (amortized every 512).
+	lastPrune types.SeqNum
+
 	// pendingSpec — blocks awaiting speculative execution. A commit event
 	// can arrive before the spec frontier reaches the block's parent (a
 	// proposed block may be coherent before its parent is canonically
@@ -64,19 +75,35 @@ type Ledger struct {
 	commitDone chan struct{}
 }
 
+// certifierEntry — the lowest-round observed QC certifying a block id, with
+// the certifying block's timestamp (synthesized commit for the tip height).
+type certifierEntry struct {
+	qc cstypes.QuorumCertificate
+	ts types.U128
+}
+
 var _ swarm.Ledger = (*Ledger)(nil)
 
 func NewLedger(app *App, spec *SpecApp) *Ledger {
 	l := &Ledger{
-		app:         app,
-		spec:        spec,
-		blocks:      map[types.BlockId]*cstypes.ConsensusFullBlock{},
-		committed:   map[types.SeqNum]*cstypes.ConsensusFullBlock{},
-		pendingSpec: map[types.BlockId]*cstypes.ConsensusFullBlock{},
-		commitQ:     make(chan *cstypes.ConsensusFullBlock, 1024),
-		commitDone:  make(chan struct{}),
+		app:           app,
+		spec:          spec,
+		blocks:        map[types.BlockId]*cstypes.ConsensusFullBlock{},
+		committed:     map[types.SeqNum]*cstypes.ConsensusFullBlock{},
+		committedByID: map[types.BlockId]types.SeqNum{},
+		certifiers:    map[types.BlockId]certifierEntry{},
+		pendingSpec:   map[types.BlockId]*cstypes.ConsensusFullBlock{},
+		commitQ:       make(chan *cstypes.ConsensusFullBlock, 1024),
+		commitDone:    make(chan struct{}),
 	}
 	return l
+}
+
+// SetRetain — bound the in-memory block maps to the last `keep` committed
+// seqs; pruneKeep bounds the durable stores (0 = retain everything on disk).
+func (l *Ledger) SetRetain(keep, pruneKeep types.SeqNum) {
+	l.retain = keep
+	l.pruneKeep = pruneKeep
 }
 
 // Close — drain the canonical-commit queue and stop the worker. Callers must
@@ -106,28 +133,45 @@ func (l *Ledger) AttachBlockStore(bs *store.BlockStore, cp *cstypes.Checkpoint) 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.bs = bs
-	all, err := bs.AllBlocks()
+	// Bounded rebuild: the fin/ tip names the canonical committed height;
+	// only the last `retain` seqs are materialized into memory — everything
+	// older resolves through the store on demand (blocksync/RPC fallbacks).
+	finTip, err := bs.FinalizedTip()
+	if err != nil {
+		return fmt.Errorf("bridge: load finalized tip: %w", err)
+	}
+	floor := types.SeqNum(0)
+	if l.retain > 0 && finTip > l.retain {
+		floor = finTip - l.retain + 1
+	}
+	all, err := bs.BlocksSince(floor)
 	if err != nil {
 		return fmt.Errorf("bridge: load blocks: %w", err)
 	}
 	for _, b := range all {
-		l.blocks[b.GetId()] = b
+		l.indexBlock(b)
 	}
-	fin, err := bs.FinalizedBlocks()
+	fin, err := bs.FinalizedSince(floor)
 	if err != nil {
 		return fmt.Errorf("bridge: load finalized: %w", err)
 	}
 	for _, b := range fin {
-		l.blocks[b.GetId()] = b
-		l.committed[b.GetSeqNum()] = b
+		l.indexBlock(b)
+		l.markCommitted(b)
 	}
 	// The app's result index records the exact winner per committed height
 	// (written post-app-commit); prefer it over the fin/ index, which a
-	// crash can leave one commit behind.
-	for h := int64(1); h <= l.app.committedHeight(); h++ {
+	// crash can leave one commit behind. Only the recent window can diverge
+	// (the gap is a few heights at most).
+	appTip := l.app.committedHeight()
+	lo := int64(1)
+	if appTip > 64 {
+		lo = appTip - 64
+	}
+	for h := lo; h <= appTip; h++ {
 		if _, bid, _, _, _, _, ok := l.app.CommittedEntry(h); ok {
-			if b := l.blocks[bid]; b != nil {
-				l.committed[b.GetSeqNum()] = b
+			if b := l.getBlock(bid); b != nil {
+				l.markCommitted(b)
 			}
 		}
 	}
@@ -152,7 +196,7 @@ func (l *Ledger) reconcileStoreTip(cp *cstypes.Checkpoint) {
 	var rootID types.BlockId
 	if cp != nil {
 		rootID = cp.Root
-		if root := l.blocks[cp.Root]; root != nil {
+		if root := l.getBlock(cp.Root); root != nil {
 			rootSeq = int64(root.GetSeqNum().Uint64())
 		}
 	}
@@ -179,7 +223,7 @@ func (l *Ledger) reconcileStoreTip(cp *cstypes.Checkpoint) {
 	// the forkpoint root.
 	var gap []*cstypes.ConsensusFullBlock
 	for id := cp.Root; ; {
-		b := l.blocks[id]
+		b := l.getBlock(id)
 		if b == nil {
 			break
 		}
@@ -209,7 +253,7 @@ func (l *Ledger) reconcileStoreTip(cp *cstypes.Checkpoint) {
 			blockID: h.GetId(),
 			txs:     body.Txs,
 		})
-		l.committed[h.SeqNum] = b
+		l.markCommitted(b)
 		l.app.fillValSetGap(seq)
 		if err := l.bs.PutFinalized(h.SeqNum, h.GetId()); err != nil {
 			if errors.Is(err, store.ErrClosed) {
@@ -244,6 +288,54 @@ func (l *Ledger) persistBlock(b *cstypes.ConsensusFullBlock) {
 	}
 }
 
+// insertBlock — record an observed block: memory index, certifier index
+// (its header QC certifies the parent — used to serve tip-height commits
+// before the certifier itself is committed), and the durable store.
+// Callers must hold l.mu.
+func (l *Ledger) insertBlock(b *cstypes.ConsensusFullBlock) {
+	l.indexBlock(b)
+	l.persistBlock(b)
+}
+
+// indexBlock — memory indexes only (AttachBlockStore rebuild: the blocks
+// came from the store, so re-persisting is wasted fsyncs).
+func (l *Ledger) indexBlock(b *cstypes.ConsensusFullBlock) {
+	id := b.GetId()
+	l.blocks[id] = b
+	qc := b.Header.QC
+	if parent := qc.GetBlockId(); parent != types.GENESIS_BLOCK_ID {
+		if cur, ok := l.certifiers[parent]; !ok || qc.Info.Round < cur.qc.Info.Round {
+			l.certifiers[parent] = certifierEntry{qc: qc, ts: b.Header.TimestampNs}
+		}
+	}
+}
+
+// markCommitted — index a block as the canonical committed block at its
+// seq (memory maps; durable fin/ row is written by the commit worker).
+// Callers must hold l.mu.
+func (l *Ledger) markCommitted(b *cstypes.ConsensusFullBlock) {
+	seq := b.GetSeqNum()
+	l.committed[seq] = b
+	l.committedByID[b.GetId()] = seq
+	if seq > l.maxCommitted {
+		l.maxCommitted = seq
+	}
+}
+
+// getBlock — in-memory first, then the durable store (below-floor serving).
+// Callers must hold l.mu.
+func (l *Ledger) getBlock(id types.BlockId) *cstypes.ConsensusFullBlock {
+	if b := l.blocks[id]; b != nil {
+		return b
+	}
+	if l.bs != nil {
+		if b, err := l.bs.GetBlock(id); err == nil {
+			return b
+		}
+	}
+	return nil
+}
+
 // Exec — LedgerCommand dispatch (mirrors MockLedger, Finalized executes).
 func (l *Ledger) Exec(cmds []glue.LedgerCommand) {
 	l.mu.Lock()
@@ -258,12 +350,10 @@ func (l *Ledger) execLocked(cmds []glue.LedgerCommand) {
 		case glue.LedgerCommit:
 			switch c.Commit.Kind {
 			case glue.CommitProposed, glue.CommitVoted:
-				l.blocks[c.Commit.Block.GetId()] = c.Commit.Block
-				l.persistBlock(c.Commit.Block)
+				l.insertBlock(c.Commit.Block)
 				l.speculate(c.Commit.Block)
 			case glue.CommitFinalized:
-				l.blocks[c.Commit.Block.GetId()] = c.Commit.Block
-				l.persistBlock(c.Commit.Block)
+				l.insertBlock(c.Commit.Block)
 				l.commitFinalized(c.Commit.Block)
 			}
 		case glue.LedgerFetchHeaders:
@@ -296,11 +386,11 @@ func (l *Ledger) commitFinalized(block *cstypes.ConsensusFullBlock) {
 		if b.GetParentId() == types.GENESIS_BLOCK_ID {
 			break // parent is genesis — nothing further to commit
 		}
-		par := l.blocks[b.GetParentId()]
+		par := l.getBlock(b.GetParentId())
 		if par == nil {
 			// ancestor not yet seen — the commit chain is contiguous by
 			// consensus construction, so this only happens if the parent was
-			// pruned; treat as an invariant violation.
+			// never persisted; treat as an invariant violation.
 			panic(fmt.Sprintf("bridge: finalized block seq %d missing parent", seq.Uint64()))
 		}
 		b = par
@@ -313,7 +403,7 @@ func (l *Ledger) commitFinalized(block *cstypes.ConsensusFullBlock) {
 		if _, done := l.committed[b.GetSeqNum()]; done {
 			continue
 		}
-		l.committed[b.GetSeqNum()] = b
+		l.markCommitted(b)
 		l.commitOnce.Do(func() {
 			l.commitWg.Add(1)
 			go l.commitLoop()
@@ -487,8 +577,9 @@ func (l *Ledger) finalizeDirect(block *cstypes.ConsensusFullBlock, body *EvmBody
 func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []byte, updates []abcitypes.ValidatorUpdate,
 	txResults []*abcitypes.ExecTxResult, events []abcitypes.Event) {
 	h := block.Header
+	seq := int64(h.SeqNum.Uint64())
 	body := block.Body.Inner.ExecutionBody.(*EvmBody)
-	l.app.recordCommit(int64(h.SeqNum.Uint64()), resultEntry{
+	l.app.recordCommit(seq, resultEntry{
 		header:     &EvmFinalizedHeader{Number: h.SeqNum, AppHash: appHash},
 		blockID:    h.GetId(),
 		txs:        body.Txs,
@@ -496,7 +587,9 @@ func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []by
 		events:     events,
 		valUpdates: updates,
 	})
-	l.committed[h.SeqNum] = block
+	l.markCommitted(block)
+	// Index the synthesized comet hash once per commit (post-applyUpdates so
+	// nextValidatorsHash is final) — block_by_hash stays O(1).
 	if l.commitHook != nil {
 		l.pendingHooks = append(l.pendingHooks, int64(h.SeqNum.Uint64()))
 	}
@@ -508,9 +601,12 @@ func (l *Ledger) recordCommitted(block *cstypes.ConsensusFullBlock, appHash []by
 			panic(fmt.Sprintf("bridge: persist finalized %d: %v", h.SeqNum, err))
 		}
 	}
-	if err := l.app.applyUpdates(int64(h.SeqNum.Uint64()), updates); err != nil {
+	if err := l.app.applyUpdates(seq, updates); err != nil {
 		panic(err)
 	}
+	hdr := l.app.synthHeader(block)
+	l.app.RecordCmtHash(hdr.Hash(), seq)
+	l.pruneLocked(h.SeqNum)
 }
 
 // applySyncedBlock — replay one statesync-served block through the direct
@@ -530,7 +626,7 @@ func (l *Ledger) applySyncedBlockLocked(block *cstypes.ConsensusFullBlock) {
 	if seq <= l.app.committedHeight() {
 		return
 	}
-	l.blocks[block.GetId()] = block
+	l.insertBlock(block)
 	body, ok := block.Body.Inner.ExecutionBody.(*EvmBody)
 	if !ok {
 		panic(fmt.Sprintf("bridge: synced block seq %d unexpected body %T",
@@ -543,67 +639,122 @@ func (l *Ledger) applySyncedBlockLocked(block *cstypes.ConsensusFullBlock) {
 	l.recordCommitted(block, appHash, updates, txResults, events)
 }
 
+// pruneLocked — drop in-memory map entries below tip-retain (they stay
+// durable in the store; readers fall back). Optional disk pruning runs
+// every 512 commits when pruneKeep is set. Callers must hold l.mu.
+func (l *Ledger) pruneLocked(tip types.SeqNum) {
+	if l.retain > 0 && tip > l.retain {
+		floor := tip - l.retain
+		for id, b := range l.blocks {
+			if b.GetSeqNum() < floor {
+				delete(l.blocks, id)
+				delete(l.certifiers, id)
+			}
+		}
+		for seq, b := range l.committed {
+			if seq < floor {
+				delete(l.committed, seq)
+				delete(l.committedByID, b.GetId())
+			}
+		}
+	}
+	if l.pruneKeep > 0 && l.bs != nil &&
+		tip > l.pruneKeep+l.retain && tip-l.lastPrune >= 512 {
+		l.lastPrune = tip
+		cutoff := tip - l.pruneKeep
+		if err := l.bs.PruneBelow(cutoff); err != nil && !errors.Is(err, store.ErrClosed) {
+			panic(fmt.Sprintf("bridge: prune blockstore below %d: %v", cutoff, err))
+		}
+		if a := l.app; a.store != nil {
+			if err := a.store.PruneBefore(int64(cutoff)); err != nil {
+				panic(fmt.Sprintf("bridge: prune result store below %d: %v", cutoff, err))
+			}
+		}
+	}
+}
+
 // committedBlock — canonical finalized block at seq (statesync serving).
+// In-memory window first, then the durable fin/ index.
 func (l *Ledger) committedBlock(seq types.SeqNum) *cstypes.ConsensusFullBlock {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return l.committed[seq]
-}
-
-// committedBlockByID — canonical block lookup by ID (RPC /block_by_hash).
-func (l *Ledger) committedBlockByID(id types.BlockId) *cstypes.ConsensusFullBlock {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	for _, b := range l.committed {
-		if b.GetId() == id {
+	if b := l.committed[seq]; b != nil {
+		return b
+	}
+	if l.bs != nil {
+		if b, err := l.bs.GetFinalized(seq); err == nil {
 			return b
 		}
 	}
 	return nil
 }
 
+// committedBlockByID — canonical block lookup by ID (RPC /block_by_hash):
+// O(1) via committedByID, store fallback for below-window heights.
+func (l *Ledger) committedBlockByID(id types.BlockId) *cstypes.ConsensusFullBlock {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if seq, ok := l.committedByID[id]; ok {
+		return l.committed[seq]
+	}
+	if l.bs == nil {
+		return nil
+	}
+	b, err := l.bs.GetBlock(id)
+	if err != nil || b == nil {
+		return nil
+	}
+	fid, ok, err := l.bs.GetFinalizedID(b.GetSeqNum())
+	if err != nil || !ok || fid != id {
+		return nil
+	}
+	return b
+}
+
 // certifierQC — an observed (proposed/voted/committed) child block whose
 // header QC certifies (seq, id): lets Commit serve the tip height before
-// the certifying block is itself committed. Deterministic: lowest round.
+// the certifying block is itself committed. Deterministic: lowest round,
+// maintained incrementally in the certifiers index.
 func (l *Ledger) certifierQC(id types.BlockId) (cstypes.QuorumCertificate, types.U128, bool) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	var found bool
-	var best cstypes.QuorumCertificate
-	var ts types.U128
-	for _, b := range l.blocks {
-		qc := b.Header.QC
-		if qc.GetBlockId() != id {
-			continue
-		}
-		if !found || qc.Info.Round < best.Info.Round {
-			found, best, ts = true, qc, b.Header.TimestampNs
-		}
+	if e, ok := l.certifiers[id]; ok {
+		return e.qc, e.ts, true
 	}
-	return best, ts, found
+	// Below the window the certifier is the committed successor's QC.
+	if l.bs == nil {
+		return cstypes.QuorumCertificate{}, types.U128{}, false
+	}
+	b, err := l.bs.GetBlock(id)
+	if err != nil || b == nil {
+		return cstypes.QuorumCertificate{}, types.U128{}, false
+	}
+	next, err := l.bs.GetFinalized(b.GetSeqNum() + 1)
+	if err != nil || next == nil {
+		return cstypes.QuorumCertificate{}, types.U128{}, false
+	}
+	return next.Header.QC, next.Header.TimestampNs, true
 }
 
 // committedSeq — highest committed seq (statesync service window).
 func (l *Ledger) committedSeq() types.SeqNum {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	var max types.SeqNum
-	for seq := range l.committed {
-		if seq > max {
-			max = seq
-		}
-	}
-	return max
+	return l.maxCommitted
 }
 
 // committedID — the canonical block ID at a committed seq (genesis → zero ID).
 // Callers must hold l.mu.
 func (l *Ledger) committedID(seq int64) types.BlockId {
-	b := l.committed[types.SeqNum(seq)]
-	if b == nil {
-		return types.GENESIS_BLOCK_ID
+	if b := l.committed[types.SeqNum(seq)]; b != nil {
+		return b.GetId()
 	}
-	return b.GetId()
+	if l.bs != nil {
+		if id, ok, err := l.bs.GetFinalizedID(types.SeqNum(seq)); err == nil && ok {
+			return id
+		}
+	}
+	return types.GENESIS_BLOCK_ID
 }
 
 // getHeaders / getPayload — blocksync self-fetch over the local block store
@@ -615,8 +766,8 @@ func (l *Ledger) getHeaders(blockRange cstypes.BlockRange) blocksync.ResponseMes
 		if nextID == types.GENESIS_BLOCK_ID {
 			break // chain terminus — no stored genesis block
 		}
-		block, ok := l.blocks[nextID]
-		if !ok {
+		block := l.getBlock(nextID)
+		if block == nil {
 			return blocksync.ResponseHeadersNotAvailable(blockRange)
 		}
 		headers = append([]cstypes.ConsensusBlockHeader{block.Header}, headers...)
@@ -629,6 +780,13 @@ func (l *Ledger) getHeaders(blockRange cstypes.BlockRange) blocksync.ResponseMes
 }
 
 func (l *Ledger) getPayload(payloadID cstypes.ConsensusBlockBodyId) blocksync.ResponseMessage {
+	if l.bs != nil {
+		// pld/ index is O(1) — prefer it over the bounded in-memory scan.
+		if body, err := l.bs.GetPayload(payloadID); err == nil && body != nil {
+			return blocksync.ResponsePayload(*body)
+		}
+		return blocksync.ResponsePayloadNotAvailable(payloadID)
+	}
 	for _, fullBlock := range l.blocks {
 		if fullBlock.GetBodyId() == payloadID {
 			return blocksync.ResponsePayload(fullBlock.Body)

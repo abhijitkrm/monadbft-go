@@ -231,15 +231,164 @@ func (s *BlockStore) AllBlocks() ([]*cstypes.ConsensusFullBlock, error) {
 	return out, it.Error()
 }
 
-// FinalizedBlocks — committed (seq, block) pairs in seq order.
-func (s *BlockStore) FinalizedBlocks() ([]*cstypes.ConsensusFullBlock, error) {
+// GetFinalizedID — the finalized canonical block id at seq; ok=false when
+// no fin/ entry exists.
+func (s *BlockStore) GetFinalizedID(seq types.SeqNum) (types.BlockId, bool, error) {
+	idb, err := s.get(finKey(seq))
+	if err == pebble.ErrNotFound {
+		return types.BlockId{}, false, nil
+	}
+	if err != nil {
+		return types.BlockId{}, false, err
+	}
+	var id types.BlockId
+	copy(id[:], idb)
+	return id, true, nil
+}
+
+// GetFinalized — the finalized block at seq via the fin/ index; nil if
+// absent (unfinalized or pruned).
+func (s *BlockStore) GetFinalized(seq types.SeqNum) (*cstypes.ConsensusFullBlock, error) {
+	id, ok, err := s.GetFinalizedID(seq)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return s.GetBlock(id)
+}
+
+// FinalizedTip — the highest finalized seq (iterator Last on fin/); 0 on an
+// empty store.
+func (s *BlockStore) FinalizedTip() (types.SeqNum, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0, ErrClosed
+	}
+	it, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: finPrefix,
+		UpperBound: prefixUpperBound(finPrefix),
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer it.Close()
+	if !it.Last() {
+		return 0, it.Error()
+	}
+	return types.SeqNum(binary.BigEndian.Uint64(it.Key()[4:])), it.Error()
+}
+
+// BlocksSince — every block whose seq index entry is ≥ floor, seq-ordered.
+// The seq/ index maps a seq to the last-written block id, so forked siblings
+// at the same seq are skipped — the windowed ledger rebuild only needs one
+// canonical candidate per height.
+func (s *BlockStore) BlocksSince(floor types.SeqNum) ([]*cstypes.ConsensusFullBlock, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return nil, ErrClosed
 	}
 	it, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: finPrefix,
+		LowerBound: seqKey(floor),
+		UpperBound: prefixUpperBound(seqPrefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var out []*cstypes.ConsensusFullBlock
+	for it.First(); it.Valid(); it.Next() {
+		var id types.BlockId
+		copy(id[:], it.Value())
+		b, err := s.getBlock(id)
+		if err != nil {
+			return nil, err
+		}
+		if b != nil {
+			out = append(out, b)
+		}
+	}
+	return out, it.Error()
+}
+
+// PruneBelow — delete every store artifact for blocks below floorSeq:
+// blk/, seq/, fin/ rows and their pld/ index entries. Iterates the seq/
+// index to find ids, then ranges-deletes the height-keyed spaces.
+func (s *BlockStore) PruneBelow(floor types.SeqNum) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+	var ids []types.BlockId
+	var bodies []cstypes.ConsensusBlockBodyId
+	it, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: seqPrefix,
+		UpperBound: seqKey(floor),
+	})
+	if err != nil {
+		return err
+	}
+	var iterErr error
+	for it.First(); it.Valid(); it.Next() {
+		var id types.BlockId
+		copy(id[:], it.Value())
+		b, err := s.getBlock(id)
+		if err != nil {
+			iterErr = err
+			break
+		}
+		if b != nil {
+			ids = append(ids, id)
+			bodies = append(bodies, b.GetBodyId())
+		}
+	}
+	cerr := it.Close()
+	if iterErr != nil {
+		return iterErr
+	}
+	if cerr != nil {
+		return cerr
+	}
+	if err := s.db.DeleteRange(seqPrefix, seqKey(floor), syncWrite); err != nil {
+		return err
+	}
+	if err := s.db.DeleteRange(finPrefix, finKey(floor), syncWrite); err != nil {
+		return err
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	for _, id := range ids {
+		if err := batch.Delete(blkKey(id), nil); err != nil {
+			return err
+		}
+	}
+	for _, pid := range bodies {
+		if err := batch.Delete(pldKey(pid), nil); err != nil {
+			return err
+		}
+	}
+	return batch.Commit(syncWrite)
+}
+
+// FinalizedSince — committed blocks at seq ≥ floor, in seq order.
+func (s *BlockStore) FinalizedSince(floor types.SeqNum) ([]*cstypes.ConsensusFullBlock, error) {
+	return s.finalizedRange(finKey(floor))
+}
+
+// FinalizedBlocks — committed (seq, block) pairs in seq order.
+func (s *BlockStore) FinalizedBlocks() ([]*cstypes.ConsensusFullBlock, error) {
+	return s.finalizedRange(finPrefix)
+}
+
+func (s *BlockStore) finalizedRange(lower []byte) ([]*cstypes.ConsensusFullBlock, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	it, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
 		UpperBound: prefixUpperBound(finPrefix),
 	})
 	if err != nil {
