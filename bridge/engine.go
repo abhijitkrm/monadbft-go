@@ -14,7 +14,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
@@ -87,6 +89,10 @@ type EngineConfig struct {
 	// MetricsAddr — optional "host:port" serving /metrics (Prometheus
 	// exposition of the consensus counters). Empty = disabled.
 	MetricsAddr string `json:"metrics_addr"`
+
+	// RPCAddr — CometBFT-compat JSON-RPC listen address ("host:port").
+	// Empty = use config.toml rpc.laddr; "off" disables the surface.
+	RPCAddr string `json:"rpc_addr"`
 
 	// RaptorCast/peerdisc fleet tuning (upstream devnet defaults apply).
 	MaxNumPeers  int `json:"max_num_peers"`  // peerdisc cap (default 200)
@@ -208,8 +214,10 @@ type monadEngine struct {
 	app    *App
 
 	metricsSrv *http.Server // /metrics endpoint (empty addr = disabled)
+	rpcSrv     *RPCServer   // CometBFT-compat HTTP+WS surface
 	bus        *cmttypes.EventBus
 	client     *Client
+	consSnap   atomic.Pointer[map[string]any] // last-commit round snapshot
 
 	stopOnce sync.Once
 }
@@ -303,6 +311,9 @@ func (e *monadEngine) stop() error {
 	}
 	if e.spec != nil {
 		e.spec.Close()
+	}
+	if e.rpcSrv != nil {
+		e.rpcSrv.Close()
 	}
 	if e.client != nil && e.client.IsRunning() {
 		_ = e.client.Stop()
@@ -559,6 +570,36 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	if err := client.Start(); err != nil {
 		return nil, err
 	}
+
+	// CometBFT-compat HTTP/WS RPC — CometBFT normally binds this itself
+	// from rpc.laddr; monadbft must serve its own. rpc_addr in
+	// monadbft.json overrides ("" or "off" disables).
+	laddr := cfg.RPCAddr
+	if laddr == "" && opts.Config != nil && opts.Config.RPC != nil {
+		laddr = strings.TrimPrefix(opts.Config.RPC.ListenAddress, "tcp://")
+	}
+	if laddr != "" && laddr != "off" {
+		srv := NewRPCServer(bapp, ledger, pool, selfID, genDoc.ChainID)
+		srv.SetPeersFunc(func() []glue.PeerEntry {
+			if n := eng.curNode(); n != nil {
+				return n.Peers()
+			}
+			return nil
+		})
+		srv.SetEventBus(bus)
+		srv.SetConsStateFunc(func() map[string]any {
+			if snap := eng.consSnap.Load(); snap != nil {
+				return *snap
+			}
+			return map[string]any{"height": "0", "step": "no commits yet"}
+		})
+		if err := srv.Start(laddr); err != nil {
+			slog.Warn("monadbft: RPC server start failed", "addr", laddr, "err", err)
+		} else {
+			eng.rpcSrv = srv
+			slog.Info("monadbft: CometBFT RPC listening", "addr", srv.Addr())
+		}
+	}
 	eng.client = client
 
 	// /metrics — live counters off the current node (resolves per-request so
@@ -622,6 +663,45 @@ func (e *monadEngine) publishCommit(seq int64) {
 			Height: seq, Index: uint32(i), Tx: tx, Result: res,
 		}})
 	}
+
+	// dump_consensus_state snapshot — this hook is the one safe read
+	// point into consensus internals (the state machine itself is owned
+	// by the node loop). Height/round describe the last finalized block;
+	// CometBFT's live step is not reproducible outside the loop.
+	h := b.Header
+	qc := h.QC
+	id := h.GetId()
+	author := ""
+	if e.app != nil {
+		author = strings.ToUpper(hex.EncodeToString(e.app.ConsAddr(h.Author)))
+	}
+	vals := e.app.Validators()
+	valsJSON := make([]map[string]any, len(vals))
+	for i, v := range vals {
+		valsJSON[i] = map[string]any{
+			"address":      strings.ToUpper(hex.EncodeToString(v.Address)),
+			"voting_power": strconv.FormatInt(v.VotingPower, 10),
+		}
+	}
+	votes := e.app.LastCommit(qc)
+	votesJSON := make([]map[string]any, len(votes.Votes))
+	for i, v := range votes.Votes {
+		votesJSON[i] = map[string]any{
+			"validator_address": strings.ToUpper(hex.EncodeToString(v.Validator.Address)),
+			"block_id_flag":     int(v.BlockIdFlag),
+		}
+	}
+	e.consSnap.Store(&map[string]any{
+		"height":              strconv.FormatInt(seq, 10),
+		"round":               strconv.FormatUint(uint64(qc.Info.Round), 10),
+		"step":                "commit",
+		"start_time":          time.Unix(0, int64(h.TimestampNs.Uint64())).UTC().Format(time.RFC3339Nano),
+		"commit_time":         time.Now().UTC().Format(time.RFC3339Nano),
+		"proposal_block_hash": strings.ToUpper(hex.EncodeToString(id[:])),
+		"proposer_address":    author,
+		"validators":          valsJSON,
+		"votes":               votesJSON,
+	})
 }
 
 // -- helpers --

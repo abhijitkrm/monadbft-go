@@ -14,7 +14,9 @@ require (
 	github.com/cosmos/evm v0.2.0
 	github.com/cosmos/evm/evmd v0.0.0
 	github.com/ethereum/go-ethereum v1.16.8
+	github.com/gorilla/websocket v1.5.3
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/time v0.15.0
 )
 
 require (
@@ -153,7 +155,6 @@ require (
 	github.com/googleapis/gax-go/v2 v2.22.0 // indirect
 	github.com/gorilla/handlers v1.5.2 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway v1.16.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
@@ -344,7 +345,6 @@ require (
 	golang.org/x/telemetry v0.0.0-20260508192327-42602be52be6 // indirect
 	golang.org/x/term v0.43.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect
 	google.golang.org/api v0.276.0 // indirect
 	google.golang.org/genproto v0.0.0-20260511170946-3700d4141b60 // indirect

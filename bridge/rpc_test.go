@@ -10,15 +10,30 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/require"
 
+	"crypto/rand"
+
+	cmttypes "github.com/cometbft/cometbft/types"
+	"github.com/gorilla/websocket"
+
 	"github.com/abhijitkrm/monadbft-go/bridge"
+	"github.com/abhijitkrm/monadbft-go/crypto"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
+
+// testNodeID — synthetic identity for RPC tests that don't inspect self.
+func testNodeID(t *testing.T) types.NodeId {
+	t.Helper()
+	kp, err := crypto.GenerateSecpKeyPair(rand.Reader)
+	require.NoError(t, err)
+	return types.NewNodeId(kp.PubKey())
+}
 
 // rpcGet — JSON-RPC envelope unwrap for the CometBFT shim.
 func rpcGet(t *testing.T, base, path string) map[string]any {
@@ -102,4 +117,107 @@ func TestBridgeRPC(t *testing.T) {
 	t.Logf("tx %s committed at height %s via RPC broadcast", hash[:16], committedHeight)
 
 	time.Sleep(10 * time.Millisecond)
+}
+
+// TestBridgeRPCWebsocket — WS subscribe/unsubscribe end-to-end on the
+// CometBFT dialect: connect, subscribe tm.event='NewBlock', publish on
+// the bus, receive the streamed event, unsubscribe.
+func TestBridgeRPCWebsocket(t *testing.T) {
+	bus := cmttypes.NewEventBus()
+	require.NoError(t, bus.Start())
+	defer bus.Stop()
+
+	srv := bridge.NewRPCServer(nil, nil, nil, testNodeID(t), "ws-test")
+	srv.SetEventBus(bus)
+	require.NoError(t, srv.Start("127.0.0.1:0"))
+	defer srv.Close()
+
+	wsURL := "ws://" + srv.Addr() + "/websocket"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	sub := map[string]any{
+		"jsonrpc": "2.0", "id": "sub-1", "method": "subscribe",
+		"params": map[string]any{"query": "tm.event='NewBlock'"},
+	}
+	require.NoError(t, conn.WriteJSON(sub))
+	var ack map[string]any
+	require.NoError(t, conn.ReadJSON(&ack))
+	require.Contains(t, ack, "result", "subscribe ack: %v", ack)
+
+	require.NoError(t, bus.PublishEventNewBlock(cmttypes.EventDataNewBlock{
+		Block: &cmttypes.Block{Header: cmttypes.Header{Height: 7}},
+	}))
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	var ev map[string]any
+	require.NoError(t, conn.ReadJSON(&ev))
+	require.Equal(t, "sub-1", ev["id"])
+	res := ev["result"].(map[string]any)
+	require.Equal(t, "tm.event='NewBlock'", res["query"])
+	require.NotNil(t, res["data"], "event data: %v", ev)
+
+	unsub := map[string]any{
+		"jsonrpc": "2.0", "id": "u-1", "method": "unsubscribe",
+		"params": map[string]any{"query": "tm.event='NewBlock'"},
+	}
+	require.NoError(t, conn.WriteJSON(unsub))
+	require.NoError(t, conn.ReadJSON(&ack))
+	require.Contains(t, ack, "result", "unsubscribe ack: %v", ack)
+}
+
+// TestBridgeRPCDumpConsensusState — the snapshot hook feeds round_state.
+func TestBridgeRPCDumpConsensusState(t *testing.T) {
+	srv := bridge.NewRPCServer(nil, nil, nil, testNodeID(t), "dump-test")
+	srv.SetConsStateFunc(func() map[string]any {
+		return map[string]any{
+			"height": "42", "round": "3", "step": "commit",
+			"proposal_block_hash": "ABCD",
+		}
+	})
+	require.NoError(t, srv.Start("127.0.0.1:0"))
+	defer srv.Close()
+
+	got := rpcGet(t, "http://"+srv.Addr(), "/dump_consensus_state")
+	rs := got["round_state"].(map[string]any)
+	require.Equal(t, "42", rs["height"])
+	require.Equal(t, "3", rs["round"])
+	require.Equal(t, "commit", rs["step"])
+}
+
+// TestBridgeRPCHardening — POST body cap and the search endpoints that
+// were dispatchable but never routed (block_search/tx_search).
+func TestBridgeRPCHardening(t *testing.T) {
+	srv := bridge.NewRPCServer(nil, nil, nil, testNodeID(t), "hard-test")
+	require.NoError(t, srv.Start("127.0.0.1:0"))
+	defer srv.Close()
+	base := "http://" + srv.Addr()
+
+	// Oversized POST body → rejected (parse error or conn reset when the
+	// server closes early); must not panic/OOM either way.
+	big := strings.Repeat("x", 5<<20)
+	resp, err := http.Post(base+"/health", "application/json",
+		strings.NewReader(`{"method":"health","params":{},"id":1}`+big))
+	if err == nil {
+		defer resp.Body.Close()
+		var env map[string]any
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&env))
+		require.Contains(t, env, "error", "oversized body should fail parse")
+	} // else: server RST'd mid-upload — also a valid rejection
+
+	// search routes reachable (previously missing from the mux).
+	r, err := http.Get(base + "/block_search?query=" +
+		url.QueryEscape("block.height>0"))
+	require.NoError(t, err)
+	defer r.Body.Close()
+	// nil app → error is fine, "unknown method" is the failure mode
+	var env2 map[string]any
+	require.NoError(t, json.NewDecoder(r.Body).Decode(&env2))
+	require.NotContains(t, fmt.Sprint(env2), "unknown method")
+
+	// server survived the oversized post — still serving.
+	live, err := http.Get(base + "/health")
+	require.NoError(t, err)
+	live.Body.Close()
 }
