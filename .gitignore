@@ -1,3 +1,4 @@
 /fixture-gen/target/
 *.test
 .DS_Store
+bridge/devnet

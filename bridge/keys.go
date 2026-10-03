@@ -92,6 +92,16 @@ func LoadOrGenMonadKey(path string) (secp *crypto.SecpKeyPair, bls *crypto.BlsKe
 	return secp, bls, nil
 }
 
+// WriteValidators — the inverse of LoadValidators: marshal bindings to the
+// genesis binding file (devnet/testnet tooling).
+func WriteValidators(path string, bindings []ValidatorBinding) error {
+	raw, err := json.MarshalIndent(validatorsFile{Validators: bindings}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o644)
+}
+
 // LoadValidators — the genesis validator binding file: cons pubkey →
 // MonadBFT pubkeys for every validator. Order matches the file.
 func LoadValidators(path string) ([]Validator, error) {

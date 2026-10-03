@@ -102,6 +102,10 @@ type EngineConfig struct {
 	ProposalByteLimit uint64 `json:"proposal_byte_limit"` // bytes per proposal
 	VotePaceMs        int    `json:"vote_pace_ms"`        // vote broadcast pace
 	BindIP            string `json:"bind_ip"`             // raptorcast bind address (default 0.0.0.0)
+	// AdvertiseIP — the address signed into the self name record that
+	// peerdisc gossips (replaces any stale-seq peers-file record). Required
+	// when bind_ip is unspecified (0.0.0.0): peers need a routable address.
+	AdvertiseIP string `json:"advertise_ip"`
 	// PeerdiscRefreshMs — peer-discovery refresh period (bootstrap re-ping,
 	// prune, lookup churn). Default 120s (upstream devnet); devnets want ~2s.
 	PeerdiscRefreshMs int `json:"peerdisc_refresh_ms"`
@@ -159,6 +163,19 @@ func (c EngineConfig) Validate() error {
 	if c.BindIP != "" {
 		if _, err := netip.ParseAddr(c.BindIP); err != nil {
 			return fmt.Errorf("bind_ip: %w", err)
+		}
+	}
+	if c.AdvertiseIP != "" {
+		if _, err := netip.ParseAddr(c.AdvertiseIP); err != nil {
+			return fmt.Errorf("advertise_ip: %w", err)
+		}
+	}
+	if c.Transport == "raptorcast" {
+		bind := netip.MustParseAddr(c.BindIP)
+		if !bind.Is4() || bind.IsUnspecified() {
+			if _, err := netip.ParseAddr(c.AdvertiseIP); err != nil || c.AdvertiseIP == "" {
+				return fmt.Errorf("advertise_ip required when bind_ip is unspecified (raptorcast)")
+			}
 		}
 	}
 	if c.Beneficiary != "" {
@@ -753,8 +770,14 @@ func buildRaptorcast(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPai
 	// Self-record seq must exceed whatever the peers file advertised for us
 	// (peers drop stale-seq records as anti-replay). Wall-clock seconds, as
 	// upstream does when re-signing self records at boot.
+	// The self record's address is what peers dial — advertise_ip, falling
+	// back to bind_ip when it's a concrete (routable) address.
+	adv := ip
+	if cfg.AdvertiseIP != "" {
+		adv = netip.MustParseAddr(cfg.AdvertiseIP)
+	}
 	selfRecord := peerdisc.NewMonadNameRecord(
-		peerdisc.NewNameRecordWithPorts(ip,
+		peerdisc.NewNameRecordWithPorts(adv,
 			uint16(tcpPort), uint16(cfg.UDPPort), uint16(cfg.AuthPort), 0, 0,
 			uint64(time.Now().Unix())),
 		key)
