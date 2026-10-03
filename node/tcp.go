@@ -1,6 +1,7 @@
 package node
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -53,6 +54,11 @@ type TCPTransport struct {
 
 // TCPConfig — static peering for the TCP transport.
 type TCPConfig struct {
+	// Key — this node's secp256k1 keypair; the handshake proves possession
+	// (challenger nonce signed under DomainTCPAuth). Required: without it a
+	// claimed NodeId can't be authenticated and the id-keyed conn table is
+	// an eviction vector.
+	Key *crypto.SecpKeyPair
 	// Listen is the bind address ("host:port"). Ignored when Listener is set.
 	Listen string
 	// Listener — optional pre-bound socket (tests can take :0 then advertise
@@ -122,6 +128,9 @@ func (t *TCPTransport) maxMessage() int {
 // Start opens the listener, spawns the accept loop, and launches a dial loop
 // for every configured peer.
 func (t *TCPTransport) Start() error {
+	if t.cfg.Key == nil {
+		return fmt.Errorf("tcp transport: Key required (handshake authentication)")
+	}
 	ln := t.cfg.Listener
 	if ln == nil {
 		var err error
@@ -333,18 +342,25 @@ func (t *TCPTransport) dialLoop(want types.NodeId, addr string) {
 	}
 }
 
-// handshake — exchange 33-byte NodeIds. Both sides write first, then read —
-// symmetric so neither can deadlock. The NodeId carries no authentication
-// yet (Track B wireauth); message signatures are verified inside MonadState
-// regardless, so a spoofed id cannot forge.
+// handshake — authenticated key exchange. Each side sends
+// [u16 idLen][idBytes][32B nonce], then a 65-byte recoverable signature over
+// (claimedId || peer nonce) under DomainTCPAuth — proof-of-possession of the
+// claimed NodeId, bound to the fresh challenge so it can't be replayed.
+// Without it a claimed id could evict a validator's real connection
+// (register() keys conns by NodeId).
 func (t *TCPTransport) handshake(conn net.Conn) (types.NodeId, error) {
 	_ = conn.SetDeadline(time.Now().Add(tcpHandshakeTimeout))
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return types.NodeId{}, err
+	}
 	idBytes := t.self.PubKey.Bytes()
-	msg := make([]byte, 2+len(idBytes))
+	msg := make([]byte, 2+len(idBytes)+32)
 	binary.BigEndian.PutUint16(msg[:2], uint16(len(idBytes)))
 	copy(msg[2:], idBytes)
+	copy(msg[2+len(idBytes):], nonce[:])
 	if _, err := conn.Write(msg); err != nil {
 		return types.NodeId{}, err
 	}
@@ -355,15 +371,49 @@ func (t *TCPTransport) handshake(conn net.Conn) (types.NodeId, error) {
 	if n := binary.BigEndian.Uint16(hdr[:]); n != uint16(len(idBytes)) {
 		return types.NodeId{}, fmt.Errorf("tcp handshake: bad id length %d", n)
 	}
-	buf := make([]byte, len(idBytes))
+	buf := make([]byte, len(idBytes)+32)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return types.NodeId{}, err
 	}
-	pk, err := crypto.SecpPubKeyFromBytes(buf)
+	pk, err := crypto.SecpPubKeyFromBytes(buf[:len(idBytes)])
 	if err != nil {
 		return types.NodeId{}, fmt.Errorf("tcp handshake: bad peer id: %w", err)
 	}
+	peerNonce := buf[len(idBytes):]
+
+	// Challenge-response: sign the peer's nonce bound to our claimed id.
+	sig := t.cfg.Key.Sign(crypto.DomainTCPAuth, authMsg(idBytes, peerNonce))
+	smsg := make([]byte, 2+crypto.SecpSignatureSize)
+	binary.BigEndian.PutUint16(smsg[:2], crypto.SecpSignatureSize)
+	copy(smsg[2:], sig[:])
+	if _, err := conn.Write(smsg); err != nil {
+		return types.NodeId{}, err
+	}
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return types.NodeId{}, err
+	}
+	if n := binary.BigEndian.Uint16(hdr[:]); n != crypto.SecpSignatureSize {
+		return types.NodeId{}, fmt.Errorf("tcp handshake: bad sig length %d", n)
+	}
+	var sigB [crypto.SecpSignatureSize]byte
+	if _, err := io.ReadFull(conn, sigB[:]); err != nil {
+		return types.NodeId{}, err
+	}
+	peerSig, err := crypto.SecpSignatureFromBytes(sigB[:])
+	if err != nil {
+		return types.NodeId{}, fmt.Errorf("tcp handshake: %w", err)
+	}
+	if !peerSig.Verify(crypto.DomainTCPAuth, authMsg(buf[:len(idBytes)], nonce[:]), pk) {
+		return types.NodeId{}, fmt.Errorf("tcp handshake: peer id %x failed proof-of-possession", pk[:8])
+	}
 	return types.NewNodeId(pk), nil
+}
+
+// authMsg — the handshake signing preimage: claimed pubkey || challenger nonce.
+func authMsg(id, nonce []byte) []byte {
+	m := make([]byte, 0, len(id)+len(nonce))
+	m = append(m, id...)
+	return append(m, nonce...)
 }
 
 // serve — register the connection, run reader+writer until it dies.

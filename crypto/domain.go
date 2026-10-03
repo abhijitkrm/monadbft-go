@@ -14,6 +14,11 @@ var (
 	DomainNoEndorsement    = []byte("\x17monad/no-endorsement/1\n")
 	DomainRoundSignature   = []byte("\x18monad/round-signature/1\n")
 	DomainNameRecord       = []byte("\x14monad/name-record/1\n")
+	// DomainTCPAuth — TCP-transport handshake proof-of-possession (port
+	// addition; upstream's TCP layer routes by address and authenticates at
+	// the message layer instead — our transport keys conns by NodeId, so the
+	// handshake must prove the claimed id).
+	DomainTCPAuth          = []byte("\x11monad/tcp-auth/1\n")
 	DomainRaptorcastAppMsg = []byte("\x1fmonad/raptorcast-app-message/1\n")
 	DomainRaptorcastChunk  = []byte("\x19monad/raptorcast-chunk/1\n")
 )

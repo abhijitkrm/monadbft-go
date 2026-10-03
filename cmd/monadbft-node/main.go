@@ -123,6 +123,7 @@ func main() {
 	switch *transportKind {
 	case "tcp":
 		transport = node.NewTCPTransport(self, node.TCPConfig{
+			Key:    gv.Keys[*index],
 			Listen: *listen,
 			Peers:  peerAddrs,
 		})

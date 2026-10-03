@@ -127,6 +127,7 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 		switch transportKind {
 		case "tcp":
 			transport = node.NewTCPTransport(vals[i].NodeId(), node.TCPConfig{
+				Key:    vals[i].Secp,
 				Listen: addrs[i],
 				Peers:  peerMap,
 			})
