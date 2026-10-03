@@ -137,7 +137,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 // handle — dispatch GET query-params and POST JSON-RPC {method,params,id}.
 func (s *RPCServer) handle(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(r) {
+	// Broadcast is exempt — tx ingress is bounded by the mempool, and a
+	// request-rate cap here would throttle legitimate submitters. Reads
+	// (block/tx/abci) are the expensive paths worth limiting.
+	if !strings.HasPrefix(r.URL.Path, "/broadcast_tx_") && !s.allow(r) {
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}

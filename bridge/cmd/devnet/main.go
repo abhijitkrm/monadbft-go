@@ -36,6 +36,7 @@ const (
 	authBase    = 9500
 	metricsBase = 9100
 	jsonRPCBase = 8645
+	rpcBase     = 36657 // CometBFT-compat JSON-RPC (off 26657 to dodge collisions)
 	grpcBase    = 9190
 	grpcWebBase = 9990
 	wsBase      = 8746
@@ -52,6 +53,8 @@ func main() {
 		err = cmdInitFiles(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
+	case "soak":
+		err = cmdSoak(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -66,6 +69,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage:
   devnet init-files -n 4 -o ./devnet [-evmd evmd] [-transport tcp|raptorcast|none] [-chain-id monad-1]
   devnet start      -o ./devnet [-evmd evmd]
+  devnet soak       -o ./devnet [-evmd evmd] [-rate 500] [-duration 3m] [-kill 2] [-kill-after 45s]
 `)
 }
 
@@ -84,6 +88,8 @@ func cmdInitFiles(args []string) error {
 	transport := fs.String("transport", "tcp", "consensus transport: tcp|raptorcast|none")
 	chainID := fs.String("chain-id", "monad-1", "genesis chain-id")
 	advertise := fs.String("ip", "127.0.0.1", "advertise address written into peer records")
+	fund := fs.Int("fund", 0, "also write N funded soak accounts into genesis + soak-keys.json")
+	fundAmt := fs.String("fund-amount", "1000000000000000000000000", "balance per funded account (atest)")
 	fs.Parse(args)
 
 	bin, err := evmdBin(*evmd)
@@ -168,6 +174,7 @@ func cmdInitFiles(args []string) error {
 		cfg.UDPPort = udpBase + i
 		cfg.AuthPort = authBase + i
 		cfg.MetricsAddr = fmt.Sprintf("127.0.0.1:%d", metricsBase+i)
+		cfg.RPCAddr = fmt.Sprintf("127.0.0.1:%d", rpcBase+i)
 		cfg.AdvertiseIP = ip.String()                   // self name-record addr (raptorcast)
 		cfg.ValidatorsFile = "../../../validators.json" // root/config/../../../ = <out>/
 		cfg.PeersFile = "../../../peers.json"
@@ -185,6 +192,13 @@ func cmdInitFiles(args []string) error {
 			fmt.Sprintf(`ws-address = "127.0.0.1:%d"`, wsBase+i)); err != nil {
 			return err
 		}
+	}
+
+	if *fund > 0 {
+		if err := fundSoakAccounts(*out, *fund, *fundAmt); err != nil {
+			return fmt.Errorf("fund soak accounts: %w", err)
+		}
+		fmt.Printf("devnet: %d soak accounts funded (soak-keys.json)\n", *fund)
 	}
 
 	fmt.Printf("devnet: %d validators under %s\n", *n, *out)
@@ -211,22 +225,9 @@ func cmdStart(args []string) error {
 		return err
 	}
 
-	procs := make([]*exec.Cmd, 0, len(entries))
-	for i, home := range entries {
-		c := exec.Command(bin, "start",
-			"--home", home,
-			"--engine=monadbft",
-			"--chain-id", chainID,
-			"--json-rpc.address", fmt.Sprintf("127.0.0.1:%d", jsonRPCBase+i),
-			"--grpc.address", fmt.Sprintf("localhost:%d", grpcBase+i),
-			"--grpc-web.address", fmt.Sprintf("localhost:%d", grpcWebBase+i),
-		)
-		c.Stdout = prefixWriter(fmt.Sprintf("node%d ", i), os.Stdout)
-		c.Stderr = prefixWriter(fmt.Sprintf("node%d ", i), os.Stderr)
-		if err := c.Start(); err != nil {
-			return fmt.Errorf("node%d: %w", i, err)
-		}
-		procs = append(procs, c)
+	procs, err := startNodes(entries, bin, chainID)
+	if err != nil {
+		return err
 	}
 	fmt.Printf("devnet: %d nodes started (Ctrl-C to stop)\n", len(procs))
 
@@ -240,6 +241,40 @@ func cmdStart(args []string) error {
 		_ = p.Wait()
 	}
 	return nil
+}
+
+// startOne launches a single evmd node with the per-node port layout.
+func startOne(home string, i int, bin, chainID string) (*exec.Cmd, error) {
+	c := exec.Command(bin, "start",
+		"--home", home,
+		"--engine=monadbft",
+		"--chain-id", chainID,
+		"--json-rpc.address", fmt.Sprintf("127.0.0.1:%d", jsonRPCBase+i),
+		"--grpc.address", fmt.Sprintf("localhost:%d", grpcBase+i),
+		"--grpc-web.address", fmt.Sprintf("localhost:%d", grpcWebBase+i),
+	)
+	c.Stdout = prefixWriter(fmt.Sprintf("node%d ", i), os.Stdout)
+	c.Stderr = prefixWriter(fmt.Sprintf("node%d ", i), os.Stderr)
+	if err := c.Start(); err != nil {
+		return nil, fmt.Errorf("node%d: %w", i, err)
+	}
+	return c, nil
+}
+
+// startNodes launches every home; shared by `start` and `soak`.
+func startNodes(homes []string, bin, chainID string) ([]*exec.Cmd, error) {
+	procs := make([]*exec.Cmd, 0, len(homes))
+	for i, home := range homes {
+		c, err := startOne(home, i, bin, chainID)
+		if err != nil {
+			for _, p := range procs {
+				_ = p.Process.Kill()
+			}
+			return nil, err
+		}
+		procs = append(procs, c)
+	}
+	return procs, nil
 }
 
 // replaceLine rewrites the first TOML line starting with prefix.
