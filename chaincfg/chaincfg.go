@@ -32,6 +32,21 @@ type Config interface {
 	GetStakingActivation() types.Epoch
 }
 
+// DefaultParams — Rust CHAIN_PARAMS_LATEST (v0.12.0). Chains override via
+// their chain config (bridge: monadbft.json); the simulator re-exports this.
+func DefaultParams() Params {
+	// max_reserve_balance = 10^19 (10 MON), big-endian U256.
+	var maxReserve [32]byte
+	copy(maxReserve[24:], []byte{0x8A, 0xC7, 0x23, 0x04, 0x89, 0xE8, 0x00, 0x00})
+	return Params{
+		TxLimit:           3_750,
+		ProposalGasLimit:  150_000_000,
+		ProposalByteLimit: 1_500_000,
+		MaxReserveBalance: maxReserve,
+		VotePace:          300 * time.Millisecond,
+	}
+}
+
 // StaticConfig is a single-revision config — the common case pre-upgrade.
 // Mirrors Rust MockChainConfig (epoch_length/epoch_start_delay default to
 // their MAX values; staking_activation to Epoch::MAX).

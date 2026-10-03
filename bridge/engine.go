@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -25,16 +27,17 @@ import (
 	"github.com/cosmos/cosmos-sdk/server"
 	"github.com/cosmos/evm/engine"
 	"github.com/cosmos/evm/evmd"
+	evmtypes "github.com/cosmos/evm/x/vm/types"
 
 	"github.com/abhijitkrm/monadbft-go/blocktree"
 	"github.com/abhijitkrm/monadbft-go/chaincfg"
 	"github.com/abhijitkrm/monadbft-go/consensusstate"
 	"github.com/abhijitkrm/monadbft-go/crypto"
 	"github.com/abhijitkrm/monadbft-go/glue"
+	"github.com/abhijitkrm/monadbft-go/metrics"
 	"github.com/abhijitkrm/monadbft-go/net/peerdisc"
 	"github.com/abhijitkrm/monadbft-go/node"
 	"github.com/abhijitkrm/monadbft-go/store"
-	"github.com/abhijitkrm/monadbft-go/swarm"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
@@ -68,9 +71,37 @@ type EngineConfig struct {
 	EpochLength        uint64 `json:"epoch_length"`        // valset boundary (default: never)
 	StatesyncThreshold uint64 `json:"statesync_threshold"` // blocks behind → statesync (default 1000)
 
-	BaseFee     uint64 `json:"base_fee"`    // proposal base-fee stamp (wei)
+	// RetainBlocks — in-memory window of committed blocks/results served
+	// hot (RPC tip, blocksync, event synthesis). Older heights resolve
+	// through the durable stores. 0 = unbounded (dev). Default 4096.
+	RetainBlocks uint64 `json:"retain_blocks"`
+	// PruneKeepBlocks — durable retention: prune block/result stores to the
+	// last N seqs. 0 = archive (keep all). Must be ≥ retain_blocks when set —
+	// pruning below the mem window strands the on-demand fallbacks. WARNING:
+	// pruning breaks statesync serving for peers behind the floor.
+	PruneKeepBlocks uint64 `json:"prune_keep_blocks"`
+
+	// TimestampLatencyMs — the timestamp-vs-arrival slack bound stamped on
+	// votes (upstream timestamp_latency_estimate). Raise for WAN fleets.
+	TimestampLatencyMs int `json:"timestamp_latency_ms"`
+	// MetricsAddr — optional "host:port" serving /metrics (Prometheus
+	// exposition of the consensus counters). Empty = disabled.
+	MetricsAddr string `json:"metrics_addr"`
+
+	// RaptorCast/peerdisc fleet tuning (upstream devnet defaults apply).
+	MaxNumPeers  int `json:"max_num_peers"`  // peerdisc cap (default 200)
+	MaxGroupSize int `json:"max_group_size"` // raptorcast group size (default 10)
+
+	BaseFee     uint64 `json:"base_fee"`    // proposal base-fee stamp (wei, default 100 gwei)
 	Beneficiary string `json:"beneficiary"` // 20B hex proposer fee recipient (default: self cons addr)
-	BindIP      string `json:"bind_ip"`     // raptorcast bind address (default 0.0.0.0)
+	// Chain-param overrides (0 = chaincfg.DefaultParams). These are
+	// consensus-critical: all validators MUST agree — treat as
+	// chain config, not local tuning.
+	TxLimit           uint64 `json:"tx_limit"`            // txs per proposal
+	ProposalGasLimit  uint64 `json:"proposal_gas_limit"`  // gas per proposal
+	ProposalByteLimit uint64 `json:"proposal_byte_limit"` // bytes per proposal
+	VotePaceMs        int    `json:"vote_pace_ms"`        // vote broadcast pace
+	BindIP            string `json:"bind_ip"`             // raptorcast bind address (default 0.0.0.0)
 	// PeerdiscRefreshMs — peer-discovery refresh period (bootstrap re-ping,
 	// prune, lookup churn). Default 120s (upstream devnet); devnets want ~2s.
 	PeerdiscRefreshMs int `json:"peerdisc_refresh_ms"`
@@ -83,9 +114,59 @@ func DefaultEngineConfig() EngineConfig {
 		ExecutionDelay:     4,
 		DeltaMs:            400,
 		StatesyncThreshold: 1000,
-		BaseFee:            swarm.MinBaseFee,
+		RetainBlocks:       4096,
+		TimestampLatencyMs: 10,
+		BaseFee:            100_000_000_000, // 100 gwei
 		BindIP:             "0.0.0.0",
 	}
+}
+
+// Validate — bounds + cross-field checks for monadbft.json. Called after
+// defaults+file merge in Start; also usable standalone in tests.
+func (c EngineConfig) Validate() error {
+	switch c.Transport {
+	case "", "none", "tcp", "raptorcast":
+	default:
+		return fmt.Errorf("unknown transport %q", c.Transport)
+	}
+	if c.DeltaMs <= 0 || c.DeltaMs > 60_000 {
+		return fmt.Errorf("delta_ms %d out of range (0, 60000]", c.DeltaMs)
+	}
+	if c.ExecutionDelay < 2 {
+		return fmt.Errorf("execution_delay must be ≥2 (seq-1 cannot speculate safely)")
+	}
+	// statesync thresholds decompose into StartExecution = thr/2,
+	// StatesyncToLive = thr, LiveToStatesync = 3thr/2 — a threshold below
+	// 2*execution_delay makes sync machinery unusable relative to the
+	// delayed-result window it must serve.
+	if c.StatesyncThreshold != 0 && c.StatesyncThreshold < c.ExecutionDelay {
+		return fmt.Errorf("statesync_threshold %d must be ≥ execution_delay (%d) or 0",
+			c.StatesyncThreshold, c.ExecutionDelay)
+	}
+	if c.RetainBlocks != 0 && c.RetainBlocks < 128 {
+		return fmt.Errorf("retain_blocks %d too small (<128): the serving window must cover execution_delay + recent commits", c.RetainBlocks)
+	}
+	if c.PruneKeepBlocks != 0 && c.PruneKeepBlocks < c.RetainBlocks {
+		return fmt.Errorf("prune_keep_blocks %d < retain_blocks %d: pruning below the mem window strands store fallbacks",
+			c.PruneKeepBlocks, c.RetainBlocks)
+	}
+	if c.EpochLength != 0 && c.EpochLength < c.ExecutionDelay {
+		return fmt.Errorf("epoch_length %d < execution_delay %d: epoch locking needs ≥ delay", c.EpochLength, c.ExecutionDelay)
+	}
+	if c.TimestampLatencyMs < 0 {
+		return fmt.Errorf("timestamp_latency_ms < 0")
+	}
+	if c.BindIP != "" {
+		if _, err := netip.ParseAddr(c.BindIP); err != nil {
+			return fmt.Errorf("bind_ip: %w", err)
+		}
+	}
+	if c.Beneficiary != "" {
+		if bb, err := hex.DecodeString(c.Beneficiary); err != nil || len(bb) != 20 {
+			return fmt.Errorf("beneficiary must be 20B hex")
+		}
+	}
+	return nil
 }
 
 type monadEngine struct {
@@ -108,8 +189,10 @@ type monadEngine struct {
 	ledger *Ledger
 	spec   *SpecApp
 	app    *App
-	bus    *cmttypes.EventBus
-	client *Client
+
+	metricsSrv *http.Server // /metrics endpoint (empty addr = disabled)
+	bus        *cmttypes.EventBus
+	client     *Client
 
 	stopOnce sync.Once
 }
@@ -213,6 +296,11 @@ func (e *monadEngine) stop() error {
 	if e.rs != nil {
 		_ = e.rs.Close()
 	}
+	if e.metricsSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = e.metricsSrv.Shutdown(ctx)
+		cancel()
+	}
 	return nil
 }
 
@@ -223,16 +311,29 @@ func Start(opts engine.Options) (engine.Engine, error) {
 		return nil, fmt.Errorf("monadbft: nil comet config")
 	}
 	root := opts.Config.RootDir
+	cfgPath := filepath.Join(root, "config", "monadbft.json")
 	cfg := DefaultEngineConfig()
-	if raw, err := os.ReadFile(filepath.Join(root, "config", "monadbft.json")); err == nil {
+	if raw, err := os.ReadFile(cfgPath); err == nil {
 		if err := json.Unmarshal(raw, &cfg); err != nil {
 			return nil, fmt.Errorf("monadbft.json: %w", err)
 		}
-	} else if !os.IsNotExist(err) {
+	} else if os.IsNotExist(err) {
+		// Scaffold: first boot writes the defaults so operators have the
+		// full knob surface to edit. transport=none stays legal (single-
+		// node devnets) but is loud — a multi-validator chain on none
+		// would silently never peer.
+		if raw, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+			_ = os.WriteFile(cfgPath, append(raw, '\n'), 0o644)
+			slog.Warn("monadbft: scaffolded config/monadbft.json with defaults")
+		}
+	} else {
 		return nil, err
 	}
-	if cfg.ExecutionDelay < 2 {
-		return nil, fmt.Errorf("monadbft: execution_delay must be ≥2 (seq-1 cannot speculate safely)")
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("monadbft.json: %w", err)
+	}
+	if cfg.Transport == "none" || cfg.Transport == "" {
+		slog.Warn("monadbft: transport=none — this node cannot peer (single-node dev only)")
 	}
 
 	raw, ok := opts.App.(*evmd.EVMD)
@@ -285,6 +386,7 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	// bridge app + durable indexes
 	bapp := NewApp(server.NewCometABCIWrapper(raw), vals)
 	bapp.SetRaw(raw)
+	bapp.SetRetain(int64(cfg.RetainBlocks))
 	rs, err := OpenResultStore(filepath.Join(root, "data", "bridge-results"))
 	if err != nil {
 		return nil, err
@@ -316,6 +418,7 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	dataDir := filepath.Join(root, "data", "monadbft")
 	spec := NewAsyncSpecApp(bapp)
 	ledger := NewLedger(bapp, spec)
+	ledger.SetRetain(types.SeqNum(cfg.RetainBlocks), types.SeqNum(cfg.PruneKeepBlocks))
 	pool := NewTxPool(bapp)
 	pool.SetFeeParams(cfg.BaseFee, 0, 0)
 	epochLen := types.SeqNum(cfg.EpochLength)
@@ -377,7 +480,7 @@ func Start(opts engine.Options) (engine.Engine, error) {
 				ExecutionDelay: delay,
 				Delta:          time.Duration(cfg.DeltaMs) * time.Millisecond,
 				ChainConfig: chaincfg.StaticConfig{
-					P:                 swarm.DefaultChainParams(),
+					P:                 cfg.chainParams(),
 					EpochLength:       epochLen,
 					EpochStartDelay:   types.Round(maxU64),
 					StakingActivation: types.Epoch(maxU64),
@@ -385,9 +488,9 @@ func Start(opts engine.Options) (engine.Engine, error) {
 				StatesyncToLiveThreshold:   types.SeqNum(cfg.StatesyncThreshold),
 				LiveToStatesyncThreshold:   types.SeqNum(cfg.StatesyncThreshold * 3 / 2),
 				StartExecutionThreshold:    types.SeqNum(cfg.StatesyncThreshold / 2),
-				TimestampLatencyEstimateNs: types.U128FromUint64(10_000_000),
+				TimestampLatencyEstimateNs: types.U128FromUint64(uint64(cfg.TimestampLatencyMs) * 1_000_000),
 			},
-			BlockValidator:         blocktree.MockValidator{},
+			BlockValidator:         NewEvmBlockValidator(raw.TxConfig().TxDecoder(), ethChainID(raw)),
 			BlockPolicy:            blocktree.NewEvmBlockPolicy(delay, cfg.BaseFee, 0, 0),
 			StateRead:              NewStateRead(bapp, spec),
 			GenesisValidators:      vsd,
@@ -430,10 +533,37 @@ func Start(opts engine.Options) (engine.Engine, error) {
 			cur := eng.curNode()
 			return cur != nil && cur.State().IsStatesyncing()
 		}, self)
+	client.SetPeersFunc(func() []glue.PeerEntry {
+		if n := eng.curNode(); n != nil {
+			return n.Peers()
+		}
+		return nil
+	})
 	if err := client.Start(); err != nil {
 		return nil, err
 	}
 	eng.client = client
+
+	// /metrics — live counters off the current node (resolves per-request so
+	// a supervised statesync restart doesn't strand the endpoint).
+	if cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := eng.curNode()
+			if n == nil {
+				http.Error(w, "restarting", http.StatusServiceUnavailable)
+				return
+			}
+			metrics.PrometheusHandler(n.Metrics()).ServeHTTP(w, r)
+		}))
+		eng.metricsSrv = &http.Server{Addr: cfg.MetricsAddr, Handler: mux,
+			ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := eng.metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Warn("metrics server stopped", "err", err)
+			}
+		}()
+	}
 	go eng.supervise()
 	return eng, nil
 }
@@ -479,6 +609,13 @@ func (e *monadEngine) publishCommit(seq int64) {
 
 // -- helpers --
 
+func maxOr(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
 func resolvePath(root, p string) string {
 	if filepath.IsAbs(p) {
 		return p
@@ -521,6 +658,33 @@ func initChainRequest(genDoc *cmttypes.GenesisDoc) (*abcitypes.RequestInitChain,
 	}, nil
 }
 
+// chainParams — DefaultParams with monadbft.json overrides applied.
+func (c EngineConfig) chainParams() chaincfg.Params {
+	p := chaincfg.DefaultParams()
+	if c.TxLimit > 0 {
+		p.TxLimit = c.TxLimit
+	}
+	if c.ProposalGasLimit > 0 {
+		p.ProposalGasLimit = c.ProposalGasLimit
+	}
+	if c.ProposalByteLimit > 0 {
+		p.ProposalByteLimit = c.ProposalByteLimit
+	}
+	if c.VotePaceMs > 0 {
+		p.VotePace = time.Duration(c.VotePaceMs) * time.Millisecond
+	}
+	return p
+}
+
+// ethChainID — the EVM module's chain-id for tx static checks; nil when the
+// app hasn't configured one (test apps) so the check is skipped.
+func ethChainID(raw *evmd.EVMD) *big.Int {
+	if cc := evmtypes.GetEthChainConfig(); cc != nil && cc.ChainID != nil {
+		return cc.ChainID
+	}
+	return nil
+}
+
 // buildTransport — the networking half of the engine: tcp | raptorcast |
 // none (single-node devnet).
 func buildTransport(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPair,
@@ -556,6 +720,7 @@ func buildTransport(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPair
 			}
 		}
 		return node.NewTCPTransport(self, node.TCPConfig{
+			Key:    key,
 			Listen: cfg.TCPAddress,
 			Peers:  peers,
 		}), nil
@@ -630,8 +795,8 @@ func buildRaptorcast(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPai
 			UnresponsivePruneThreshold:      5,
 			LastParticipationPruneThreshold: types.Round(5000),
 			MinNumPeers:                     0,
-			MaxNumPeers:                     200,
-			MaxGroupSize:                    10,
+			MaxNumPeers:                     maxOr(cfg.MaxNumPeers, 200),
+			MaxGroupSize:                    maxOr(cfg.MaxGroupSize, 10),
 			PingRateLimitPerSecond:          100,
 			PersistedPeersPath:              filepath.Join(dataDir, "peers.rlp"),
 			RngSeed:                         uint64(self.PubKey[0])*2654435761 + 1,

@@ -2,8 +2,12 @@ package bridge
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 	"time"
+
+	sdktypes "github.com/cosmos/cosmos-sdk/types"
+	evmtypes "github.com/cosmos/evm/x/vm/types"
 
 	"github.com/abhijitkrm/monadbft-go/blocktree"
 	"github.com/abhijitkrm/monadbft-go/chaincfg"
@@ -87,11 +91,21 @@ func NewNodeBuilder(i int, app *App, v Validator, allPeers []types.NodeId, locke
 	if err != nil {
 		return nil, err
 	}
+	// Production validation in tests too: real round-signature checks +
+	// proposal limits. The SDK decoder only exists for evmd apps.
+	var decoder sdktypes.TxDecoder
+	var ethChainID *big.Int
+	if raw := app.Raw(); raw != nil {
+		decoder = raw.TxConfig().TxDecoder()
+		if cc := evmtypes.GetEthChainConfig(); cc != nil {
+			ethChainID = cc.ChainID
+		}
+	}
 	return &swarm.NodeBuilder{
 		ID: swarm.NewID(v.NodeId()),
 		StateBuilder: &monadstate.Builder{
 			LeaderElection: validator.WeightedRoundRobin{},
-			BlockValidator: blocktree.MockValidator{},
+			BlockValidator: NewEvmBlockValidator(decoder, ethChainID),
 			BlockPolicy: blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
 				swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment),
 			StateRead: NewStateRead(app, spec),

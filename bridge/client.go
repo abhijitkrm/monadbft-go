@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/cometbft/cometbft/crypto/tmhash"
 	cmtbytes "github.com/cometbft/cometbft/libs/bytes"
 	cmtquery "github.com/cometbft/cometbft/libs/pubsub/query"
+	"github.com/cometbft/cometbft/libs/pubsub/query/syntax"
 	"github.com/cometbft/cometbft/libs/service"
 	cmtp2p "github.com/cometbft/cometbft/p2p"
 	rpcclient "github.com/cometbft/cometbft/rpc/client"
@@ -20,6 +22,7 @@ import (
 	cmttypes "github.com/cometbft/cometbft/types"
 
 	"github.com/abhijitkrm/monadbft-go/cstypes"
+	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
@@ -38,6 +41,7 @@ type Client struct {
 	genDoc *cmttypes.GenesisDoc
 	// catchingUp — consensus-side statesync predicate (nil → never).
 	catchingUp func() bool
+	peersFn    func() []glue.PeerEntry // engine wires node.Peers()
 	// selfAddr/selfPub — the local validator's app-side identity for
 	// /status validator_info.
 	selfAddr []byte
@@ -131,14 +135,11 @@ func (c *Client) Block(ctx context.Context, height *int64) (*coretypes.ResultBlo
 }
 
 func (c *Client) BlockByHash(ctx context.Context, hash []byte) (*coretypes.ResultBlock, error) {
-	tip := c.app.Height()
-	for h := tip; h >= 1; h-- {
-		b := c.ledger.committedBlock(types.SeqNum(uint64(h)))
-		if b == nil {
-			continue
-		}
-		blk := c.app.SynthBlock(b)
-		if string(blk.Hash()) == string(hash) {
+	// The comet hash index is populated per commit (RecordCmtHash) and
+	// persisted in the result store — O(1) at any chain length.
+	if h, ok := c.app.CmtHeight(hash); ok {
+		if b := c.ledger.committedBlock(types.SeqNum(uint64(h))); b != nil {
+			blk := c.app.SynthBlock(b)
 			return &coretypes.ResultBlock{
 				BlockID: cmttypes.BlockID{Hash: blk.Hash(),
 					PartSetHeader: cmttypes.PartSetHeader{Total: 1, Hash: blk.Hash()}},
@@ -282,6 +283,31 @@ func (c *Client) TxSearch(ctx context.Context, query string, prove bool,
 		}
 		return &coretypes.ResultTxSearch{Txs: []*coretypes.ResultTx{tx}, TotalCount: 1}, nil
 	}
+	if txHashCond.FindStringSubmatch(query) == nil {
+		// range query over tx.height on the committed-result index.
+		lo, hi, err := heightRange(query, "tx.height")
+		if err != nil {
+			return nil, err
+		}
+		var out []*coretypes.ResultTx
+		for h := lo; h <= hi && h <= c.app.Height(); h++ {
+			_, _, txs, txRes, _, _, ok := c.app.CommittedEntry(h)
+			if !ok {
+				continue
+			}
+			for i, tx := range txs {
+				var res abcitypes.ExecTxResult
+				if i < len(txRes) && txRes[i] != nil {
+					res = *txRes[i]
+				}
+				out = append(out, &coretypes.ResultTx{
+					Hash: tmhash.Sum(tx), Height: h,
+					Index: uint32(i), TxResult: res, Tx: tx,
+				})
+			}
+		}
+		return &coretypes.ResultTxSearch{Txs: out, TotalCount: len(out)}, nil
+	}
 	if m := txHeightCond.FindStringSubmatch(query); m != nil {
 		var height int64
 		if _, err := fmt.Sscanf(m[1], "%d", &height); err != nil {
@@ -307,9 +333,57 @@ func (c *Client) TxSearch(ctx context.Context, query string, prove bool,
 	return nil, fmt.Errorf("TxSearch: unsupported query %q (supports tx.hash, tx.height)", query)
 }
 
+// BlockSearch — supports block.height comparisons (=,>,>=,<,<=, ranges via
+// the standard q syntax "block.height > N AND block.height <= M") over the
+// committed-result index. Event-attribute search is out of scope (needs the
+// tx-indexer events table).
 func (c *Client) BlockSearch(ctx context.Context, query string, page, perPage *int,
 	orderBy string) (*coretypes.ResultBlockSearch, error) {
-	return nil, fmt.Errorf("BlockSearch not implemented")
+	if _, err := cmtquery.New(query); err != nil {
+		return nil, err
+	}
+	lo, hi, err := heightRange(query, "block.height")
+	if err != nil {
+		return nil, err
+	}
+	hi = min(hi, c.app.Height())
+	desc := orderBy == "desc"
+	var blocks []*coretypes.ResultBlock
+	step, start, end := int64(1), lo, hi
+	if desc {
+		step, start, end = -1, hi, lo
+	}
+	for h := start; h*step <= end*step; h += step {
+		if h < 1 || h > c.app.Height() {
+			break
+		}
+		fb := c.ledger.committedBlock(types.SeqNum(h))
+		if fb == nil {
+			continue
+		}
+		blk := c.app.SynthBlock(fb)
+		blocks = append(blocks, &coretypes.ResultBlock{
+			BlockID: cmttypes.BlockID{Hash: blk.Hash(),
+				PartSetHeader: cmttypes.PartSetHeader{Total: 1, Hash: blk.Hash()}},
+			Block: blk,
+		})
+	}
+	// page/perPage
+	total := len(blocks)
+	pageN, per := 1, 30
+	if page != nil {
+		pageN = *page
+	}
+	if perPage != nil {
+		per = *perPage
+	}
+	from := (pageN - 1) * per
+	if from > total {
+		blocks = nil
+	} else {
+		blocks = blocks[from:min(total, from+per)]
+	}
+	return &coretypes.ResultBlockSearch{Blocks: blocks, TotalCount: total}, nil
 }
 
 // -- HistoryClient --
@@ -356,13 +430,31 @@ func (c *Client) BlockchainInfo(ctx context.Context, minHeight, maxHeight int64)
 	}, nil
 }
 
+// SetPeersFunc — the engine wires node.Peers() so net_info reflects the
+// live transport (swaps transparently across statesync restarts).
+func (c *Client) SetPeersFunc(f func() []glue.PeerEntry) { c.peersFn = f }
+
 // -- NetworkClient --
 
 func (c *Client) NetInfo(ctx context.Context) (*coretypes.ResultNetInfo, error) {
+	var peers []coretypes.Peer
+	if c.peersFn != nil {
+		for _, e := range c.peersFn() {
+			pk := e.Pubkey.PubKey.Bytes()
+			peers = append(peers, coretypes.Peer{
+				NodeInfo: cmtp2p.DefaultNodeInfo{
+					DefaultNodeID: cmtp2p.ID(hex.EncodeToString(pk[:20])),
+					Moniker:       hex.EncodeToString(pk[:8]),
+				},
+				RemoteIP: e.Addr.String(),
+			})
+		}
+	}
 	return &coretypes.ResultNetInfo{
 		Listening: true,
 		Listeners: []string{},
-		Peers:     []coretypes.Peer{},
+		NPeers:    len(peers),
+		Peers:     peers,
 	}, nil
 }
 
@@ -620,6 +712,45 @@ func hexDecode(s string) ([]byte, error) {
 }
 
 var (
-	txHashCond   = regexp.MustCompile(`tx\.hash\s*=\s*'([0-9a-fA-F]+)'`)
+	txHashCond = regexp.MustCompile(`tx\.hash\s*=\s*'([0-9a-fA-F]+)'`)
+
 	txHeightCond = regexp.MustCompile(`tx\.height\s*=\s*'?([0-9]+)'?`)
 )
+
+// heightRange — fold "TAG op N" conditions into a [lo,hi] bound. Only the
+// given tag may appear (CometBFT event-attribute search is out of scope —
+// that lives in the tx indexer).
+func heightRange(query, tag string) (int64, int64, error) {
+	ast, err := syntax.Parse(query)
+	if err != nil {
+		return 0, 0, err
+	}
+	lo, hi := int64(1), int64(math.MaxInt64)
+	for _, cond := range ast {
+		if cond.Tag != tag {
+			return 0, 0, fmt.Errorf("unsupported tag %q (supports %s)", cond.Tag, tag)
+		}
+		if cond.Arg == nil {
+			return 0, 0, fmt.Errorf("tag %q needs a numeric operand", tag)
+		}
+		var v int64
+		if _, err := fmt.Sscanf(cond.Arg.String(), "%d", &v); err != nil {
+			return 0, 0, fmt.Errorf("bad %s operand %q", tag, cond.Arg.String())
+		}
+		switch cond.Op {
+		case syntax.TEq:
+			lo, hi = v, v
+		case syntax.TGt:
+			lo = max(lo, v+1)
+		case syntax.TGeq:
+			lo = max(lo, v)
+		case syntax.TLt:
+			hi = min(hi, v-1)
+		case syntax.TLeq:
+			hi = min(hi, v)
+		default:
+			return 0, 0, fmt.Errorf("unsupported op %s", cond.Op)
+		}
+	}
+	return lo, hi, nil
+}

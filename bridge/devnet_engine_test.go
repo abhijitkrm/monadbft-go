@@ -183,10 +183,13 @@ func TestEngineMultiNodeRestartRaptorcast(t *testing.T) {
 // full valset, per-node dirs/ports, bootstrap peer records, configs, then
 // sequential engine starts. Returns nodes+vals+genDoc for tests that then
 // exercise restart/crash/statesync scenarios.
-func bringUpDevnet(t *testing.T, chainID string, transport string, ssThreshold int) ([]*devnetNode, []Validator, EvmdConfig, *cmttypes.GenesisDoc) {
+func bringUpDevnet(t *testing.T, chainID string, transport string, ssThreshold int, fundedSenders ...int) ([]*devnetNode, []Validator, EvmdConfig, *cmttypes.GenesisDoc) {
 	const n = 4
 	vals := MakeValidators(n)
 	cfg := EvmdConfig{ChainID: chainID, EVMChainID: testconstants.EighteenDecimalsChainID, Home: t.TempDir()}
+	if len(fundedSenders) > 0 {
+		cfg.FundedSenders = fundedSenders[0]
+	}
 
 	// Shared genesis: identical app state + all four cons keys.
 	evmtypes.NewEVMConfigurator().ResetTestConfig()

@@ -17,6 +17,7 @@ import (
 	"github.com/cometbft/cometbft/crypto/tmhash"
 
 	"github.com/abhijitkrm/monadbft-go/cstypes"
+	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/types"
 )
 
@@ -40,6 +41,8 @@ type RPCServer struct {
 	self    types.NodeId
 	chainID string
 
+	peersFn func() []glue.PeerEntry // engine wires node.Peers() for net_info
+
 	http *http.Server
 	ln   net.Listener
 }
@@ -47,6 +50,9 @@ type RPCServer struct {
 func NewRPCServer(app *App, ledger *Ledger, pool *TxPool, self types.NodeId, chainID string) *RPCServer {
 	return &RPCServer{app: app, ledger: ledger, pool: pool, self: self, chainID: chainID}
 }
+
+// SetPeersFunc — live peer snapshot for net_info.
+func (s *RPCServer) SetPeersFunc(f func() []glue.PeerEntry) { s.peersFn = f }
 
 // Start binds the listener and serves until Close. Addr like ":26657".
 func (s *RPCServer) Start(addr string) error {
@@ -144,7 +150,18 @@ func (s *RPCServer) handle(w http.ResponseWriter, r *http.Request) {
 	case "status":
 		result = s.status()
 	case "net_info":
-		result = map[string]any{"listening": true, "listeners": []string{}, "n_peers": "0", "peers": []any{}}
+		var peers []any
+		if s.peersFn != nil {
+			for _, e := range s.peersFn() {
+				pk := e.Pubkey.PubKey.Bytes()
+				peers = append(peers, map[string]any{
+					"node_info": map[string]any{"id": hex.EncodeToString(pk[:20])},
+					"remote_ip": e.Addr.String(),
+				})
+			}
+		}
+		result = map[string]any{"listening": true, "listeners": []string{},
+			"n_peers": strconv.Itoa(len(peers)), "peers": peers}
 	case "block":
 		result, err = s.blockAt(paramsHeight(params))
 	case "block_by_hash":
@@ -155,6 +172,10 @@ func (s *RPCServer) handle(w http.ResponseWriter, r *http.Request) {
 		result, err = s.commitAt(paramsHeight(params))
 	case "validators":
 		result = s.validators(paramsHeight(params))
+	case "block_search":
+		result, err = s.blockSearch(params.Get("query"), params.Get("order_by"))
+	case "tx_search":
+		result, err = s.txSearch(params.Get("query"))
 	case "tx":
 		result, err = s.txByHash(params.Get("hash"))
 	case "broadcast_tx_async", "broadcast_tx_sync", "broadcast_tx_commit":
@@ -291,13 +312,78 @@ func (s *RPCServer) blockByHash(hashHex string) (any, error) {
 	if err != nil || len(bz) != 32 {
 		return nil, fmt.Errorf("invalid block hash %q", hashHex)
 	}
+	// Comet block hash → height via the persisted index (O(1)).
+	if h, ok := s.app.CmtHeight(bz); ok {
+		if fb := s.ledger.committedBlock(types.SeqNum(uint64(h))); fb != nil {
+			return s.blockJSON(fb), nil
+		}
+	}
+	// Fallback: the caller passed a consensus BlockId.
 	var id types.BlockId
 	copy(id[:], bz)
-	fb := s.ledger.committedBlockByID(id)
-	if fb == nil {
-		return nil, fmt.Errorf("block %s not found", hashHex)
+	if fb := s.ledger.committedBlockByID(id); fb != nil {
+		return s.blockJSON(fb), nil
 	}
-	return s.blockJSON(fb), nil
+	return nil, fmt.Errorf("block %s not found", hashHex)
+}
+
+// blockSearch — "block.height op N" conditions over the committed index.
+func (s *RPCServer) blockSearch(query, orderBy string) (any, error) {
+	lo, hi, err := heightRange(query, "block.height")
+	if err != nil {
+		return nil, err
+	}
+	hi = min(hi, s.app.Height())
+	desc := orderBy == "desc"
+	var blocks []any
+	step, start, end := int64(1), lo, hi
+	if desc {
+		step, start, end = -1, hi, lo
+	}
+	for h := start; h*step <= end*step; h += step {
+		if h < 1 || h > s.app.Height() {
+			break
+		}
+		if fb := s.ledger.committedBlock(types.SeqNum(h)); fb != nil {
+			blocks = append(blocks, s.blockJSON(fb))
+		}
+	}
+	return map[string]any{"blocks": blocks, "total_count": strconv.Itoa(len(blocks))}, nil
+}
+
+// txSearch — tx.hash point lookup + tx.height ranges over committed results.
+func (s *RPCServer) txSearch(query string) (any, error) {
+	if m := txHashCond.FindStringSubmatch(query); m != nil {
+		tx, err := s.txByHash(m[1])
+		if err != nil {
+			return map[string]any{"txs": []any{}, "total_count": "0"}, nil
+		}
+		return map[string]any{"txs": []any{tx}, "total_count": "1"}, nil
+	}
+	lo, hi, err := heightRange(query, "tx.height")
+	if err != nil {
+		return nil, err
+	}
+	var out []any
+	for h := lo; h <= hi && h <= s.app.Height(); h++ {
+		_, _, txs, txRes, _, _, ok := s.app.CommittedEntry(h)
+		if !ok {
+			continue
+		}
+		for i, tx := range txs {
+			var res any
+			if i < len(txRes) && txRes[i] != nil {
+				res = txRes[i]
+			}
+			out = append(out, map[string]any{
+				"hash":   strings.ToUpper(hex.EncodeToString(tmhash.Sum(tx))),
+				"height": strconv.FormatInt(h, 10),
+				"index":  i, "tx_result": res,
+				"tx": base64.StdEncoding.EncodeToString(tx),
+			})
+		}
+	}
+	return map[string]any{"txs": out, "total_count": strconv.Itoa(len(out))}, nil
 }
 
 func (s *RPCServer) blockResults(h int64) (any, error) {

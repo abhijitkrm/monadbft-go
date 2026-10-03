@@ -16,20 +16,9 @@ import (
 	"github.com/abhijitkrm/monadbft-go/validator"
 )
 
-// Default chain params — Rust CHAIN_PARAMS_LATEST (v0.12.0), used by
-// MockChainConfig::DEFAULT.
-func DefaultChainParams() chaincfg.Params {
-	// max_reserve_balance = 10^19 (10 MON), big-endian U256.
-	var maxReserve [32]byte
-	copy(maxReserve[24:], []byte{0x8A, 0xC7, 0x23, 0x04, 0x89, 0xE8, 0x00, 0x00})
-	return chaincfg.Params{
-		TxLimit:           3_750,
-		ProposalGasLimit:  150_000_000,
-		ProposalByteLimit: 1_500_000,
-		MaxReserveBalance: maxReserve,
-		VotePace:          300 * time.Millisecond,
-	}
-}
+// Default chain params — Rust CHAIN_PARAMS_LATEST, used by
+// MockChainConfig::DEFAULT. Canonical definition lives in chaincfg.
+func DefaultChainParams() chaincfg.Params { return chaincfg.DefaultParams() }
 
 // MockChainConfig — Rust MockChainConfig::DEFAULT: latest params, epoch_length
 // = SeqNum::MAX, epoch_start_delay = Round::MAX, staking_activation = Epoch::MAX.
