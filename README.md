@@ -125,21 +125,22 @@ all fields validated at `start` — out-of-bounds values fail fast.
 | `tcp_address` | `"0.0.0.0:9000"` | TCP listen addr (transport=tcp) |
 | `udp_port` | `8000` | raptorcast dataplane port |
 | `auth_port` | `9000` | peer-discovery auth port |
-| `key_file` | — | validator secp256k1 key (`monad.key.json`, `evmd init`-generated format) |
-| `validators_file` | — | validator pubkeys file (see below) |
-| `peers_file` | — | static peer list for tcp/raptorcast (`{id, ip, port, auth_port}`) |
-| `epoch_length` | `50000` | seqnums per epoch |
-| `execution_delay` | `2` | deferred-execution lag (must be ≥2) |
+| `key_file` | `monad.key.json` | this node's consensus keys — auto-generated if missing |
+| `validators_file` | — | genesis key bindings (see below) |
+| `peers_file` | — | signed bootstrap records (see below) |
+| `epoch_length` | `0` | seqnums per epoch (`0` = single epoch) |
+| `execution_delay` | `4` | deferred-execution lag (must be ≥2) |
 | `delta_ms` | `400` | round-trip estimate → timeout `δ*3 + vote_pace + δ` ≈ 1.9 s |
-| `statesync_threshold` | `0` | seqnums behind before state-sync triggers (0 = never; ≥ execution_delay otherwise) |
+| `statesync_threshold` | `1000` | seqnums behind before state-sync triggers |
 | `peerdisc_refresh_ms` | `5000` | peer-discovery refresh interval |
-| `bind_ip` / `max_num_peers` | `0.0.0.0` / `200` | raptorcast bind + peerdisc cap |
+| `bind_ip` / `max_num_peers` / `max_group_size` | `0.0.0.0` / `200` / `10` | raptorcast bind + peerdisc cap + raptor group size |
+| `advertise_ip` | `bind_ip` | self name-record address; **required** when bind_ip is unspecified (`0.0.0.0`) — peers dial what this record advertises |
 | `metrics_addr` | `""` | Prometheus scrape addr, e.g. `"127.0.0.1:9090"` |
 | `retain_blocks` | `4096` | in-memory window for committed blocks/results (0 = unbounded) |
 | `prune_keep_blocks` | `0` | durable Pebble retention (0 = keep all history) |
-| `beneficiary` | `""` | block-proposer fee-recipient address |
-| `base_fee` | `1000000000` | initial base fee |
-| `gas_limit` / `block_size` / `vote_pace_ms` / `timestamp_latency_ms` | chain defaults | chain-parameter overrides |
+| `beneficiary` | self cons addr | block-proposer fee recipient (20-byte hex) |
+| `base_fee` | `100000000000` | initial base fee, wei (100 gwei) |
+| `tx_limit` / `proposal_gas_limit` / `proposal_byte_limit` / `vote_pace_ms` / `timestamp_latency_ms` | chain defaults | proposal/chain-parameter overrides |
 
 `validators_file` — genesis binding of consensus keys to Monad keys (one
 entry per genesis validator):
@@ -167,13 +168,28 @@ entry per genesis validator):
 }]
 ```
 
-### Multi-node devnet
+### Multi-node devnet — `bridge/cmd/devnet`
 
-Each node needs its own `--home` + `monadbft.json` (unique `tcp_address` /
-`udp_port` / `auth_port`, same `validators_file`, `peers_file` listing the
-others), plus the copied `monad.key.json`. The in-process devnet harness used
-by the test suite (`newDevNet`) automates this; a scripted multi-node launcher
-is on the ops roadmap.
+Scaffolds a complete fleet: SDK-side homes via `evmd testnet init-files`,
+then per-node `monad.key.json`, shared `validators.json` (cons→secp/bls
+bindings) + `peers.json` (signed name records), and per-node `monadbft.json`
+with unique ports. JSON-RPC/WS/gRPC ports are offset per node so the fleet
+can coexist with a locally running node.
+
+```bash
+cd bridge && go build -o devnet ./cmd/devnet
+./devnet init-files -n 4 -o ./devnet-run -evmd /path/to/evmd \
+    -transport tcp            # or raptorcast | none
+./devnet start -o ./devnet-run -evmd /path/to/evmd
+#   → 4 evmd processes, prefixed logs, Ctrl-C stops all
+#   → metrics at 127.0.0.1:9100+i, JSON-RPC :8645+i, WS :8746+i
+```
+
+The generated fleet is single-host (all records advertise `-ip`,
+default `127.0.0.1`). For multi-host: set `-ip` to a routable address on
+each host's generation run, or hand-edit `peers.json` records +
+`advertise_ip` per node — the `validators.json` binding file is
+host-agnostic and shared as-is.
 
 ## Observability
 
