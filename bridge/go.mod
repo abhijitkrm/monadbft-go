@@ -365,9 +365,10 @@ replace (
 	// mirror evmd's replace set (cosmos forks / pins)
 	github.com/99designs/keyring => github.com/cosmos/keyring v1.2.0
 	github.com/abhijitkrm/monadbft-go => ../
-	// local checkout of cosmos-evm (evmd is not published as a module).
-	github.com/cosmos/evm => ../../cosmos-evm
-	github.com/cosmos/evm/evmd => ../../cosmos-evm/evmd
+	// sibling checkout of github.com/abhijitkrm/monad-evm — our cosmos-evm
+	// fork (evmd is not published as a module).
+	github.com/cosmos/evm => ../../monad-evm
+	github.com/cosmos/evm/evmd => ../../monad-evm/evmd
 	github.com/ethereum/go-ethereum => github.com/cosmos/go-ethereum v1.17.2-cosmos-0
 	github.com/gin-gonic/gin => github.com/gin-gonic/gin v1.9.1
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
