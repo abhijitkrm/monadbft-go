@@ -185,7 +185,7 @@ func committedEthHash(txCfg client.TxConfig, bz []byte) common.Hash {
 // real evmd app: the floor for achievable EVM TPS (consensus/networking can
 // only subtract from this). Reports monadbft_evm_txs_per_sec.
 func BenchmarkFinalizeBlockEvm(b *testing.B) {
-	const senders = 32 // enough parallel nonces to fill blocks
+	const senders = 128 // distinct sender accounts — same-sender txs conflict on nonce+balance writes
 	cfg := EvmdConfig{
 		ChainID: "bench-evm", EVMChainID: testconstants.EighteenDecimalsChainID,
 		FundedSenders: senders,
@@ -196,7 +196,14 @@ func BenchmarkFinalizeBlockEvm(b *testing.B) {
 		b.Fatal(err)
 	}
 	txCfg := raw.TxConfig()
-	to := common.HexToAddress("0x00000000000000000000000000000000be11c4")
+
+	// distinct recipients — a shared `to` writes one balance key and
+	// serializes BlockSTM re-execution on every tx
+	const numRecip = 512
+	recips := make([]common.Address, numRecip)
+	for i := range recips {
+		recips[i] = common.HexToAddress(fmt.Sprintf("0x%040x", i+1))
+	}
 
 	const blockTxs = 512 // ~10.7M gas — fits the 150M proposal gas limit
 	b.ReportAllocs()
@@ -212,7 +219,7 @@ func BenchmarkFinalizeBlockEvm(b *testing.B) {
 		txs := make([][]byte, 0, blockTxs)
 		for j := 0; j < blockTxs; j++ {
 			k := DerivedSenderKey(j % senders)
-			bz, _ := makeEthTx(b, txCfg, k, uint64(j/senders)+(uint64(i)*uint64(blockTxs/senders)), to, 1)
+			bz, _ := makeEthTx(b, txCfg, k, uint64(j/senders)+(uint64(i)*uint64(blockTxs/senders)), recips[j%numRecip], 1)
 			txs = append(txs, bz)
 		}
 		b.StartTimer()
