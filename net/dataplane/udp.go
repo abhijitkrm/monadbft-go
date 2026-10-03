@@ -198,7 +198,14 @@ type udpSocket struct {
 
 func udpSocketListen(id UdpSocketID, addr netip.AddrPort, bufSize int) (*udpSocket, error) {
 	udpAddr := net.UDPAddrFromAddrPort(addr)
-	conn, err := net.ListenUDP("udp", udpAddr)
+	// Bind the matching address family: "udp" on an IPv4-unspecified addr
+	// ends up on the IPv6 wildcard on some platforms (e.g. macOS) where
+	// IPv4 datagrams to peers' advertised v4 records are never delivered.
+	network := "udp4"
+	if udpAddr.IP != nil && udpAddr.IP.To4() == nil {
+		network = "udp6"
+	}
+	conn, err := net.ListenUDP(network, udpAddr)
 	if err != nil {
 		return nil, err
 	}

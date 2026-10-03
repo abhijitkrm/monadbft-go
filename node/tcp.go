@@ -321,15 +321,25 @@ func (t *TCPTransport) dialLoop(want types.NodeId, addr string) {
 			return
 		default:
 		}
-		conn, err := (&net.Dialer{Timeout: tcpHandshakeTimeout}).Dial("tcp", addr)
-		if err == nil {
-			id, herr := t.handshake(conn)
-			if herr == nil && id == want {
-				backoff = tcpDialRetryBase
-				t.serve(conn, id, true) // blocks until the conn drops
-				continue
+		// Skip the dial entirely while we already hold a conn to this peer:
+		// register() keeps exactly one conn per pair (deterministically the
+		// lower-pubkey side's outbound), so the losing direction's loop would
+		// otherwise dial→lose→redial in a tight cycle — the conn churn that
+		// exhausts ephemeral ports on a same-host devnet.
+		t.mu.Lock()
+		_, connected := t.conns[want]
+		t.mu.Unlock()
+		if !connected {
+			conn, err := (&net.Dialer{Timeout: tcpHandshakeTimeout}).Dial("tcp", addr)
+			if err == nil {
+				id, herr := t.handshake(conn)
+				if herr == nil && id == want {
+					backoff = tcpDialRetryBase
+					t.serve(conn, id, true) // blocks until the conn drops
+					continue
+				}
+				_ = conn.Close()
 			}
-			_ = conn.Close()
 		}
 		select {
 		case <-t.done:
