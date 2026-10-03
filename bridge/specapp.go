@@ -302,7 +302,16 @@ func (s *SpecApp) rewindLocked(h int64, tipID types.BlockId) error {
 	if !ok {
 		return fmt.Errorf("bridge: store %T cannot rollback", raw.CommitMultiStore())
 	}
-	if err := rms.RollbackToVersion(h); err != nil {
+	// RollbackToVersion deletes versions > h — a query context built
+	// concurrently can resolve LatestVersion ahead of the materialized
+	// IAVL trees and hit ErrVersionDoesNotExist (the mempool rechecker
+	// panic seen in soak). SpecLock serializes version deletion against
+	// CreateQueryContext, which the mempool's ctx callback also holds.
+	sl := raw.SpecLock()
+	sl.Lock()
+	err := rms.RollbackToVersion(h)
+	sl.Unlock()
+	if err != nil {
 		return err
 	}
 	for seq, e := range s.bySeq {

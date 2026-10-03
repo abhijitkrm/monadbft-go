@@ -601,6 +601,11 @@ func (a *App) RollbackTo(target int64) error {
 	if !ok {
 		return fmt.Errorf("bridge: store %T cannot rollback", a.raw.CommitMultiStore())
 	}
+	// Same version-deletion hazard as SpecApp.rewindLocked — serialize
+	// against query-context creation via the shared SpecLock.
+	sl := a.raw.SpecLock()
+	sl.Lock()
+	defer sl.Unlock()
 	return rms.RollbackToVersion(target)
 }
 
