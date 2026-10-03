@@ -38,13 +38,28 @@ type EvmdConfig struct {
 	ChainID    string
 	EVMChainID uint64
 	Home       string // appOpts FlagHome (any path; MemDB means no disk use)
+	// FundedSenders — extra deterministic funded accounts beyond the
+	// genesis sender (DerivedSenderKey(0..n-1)); e2e/bench tests sign
+	// parallel transfers without nonce contention.
+	FundedSenders int
 }
 
 // GenesisSenderKey — the deterministic ethsecp256k1 key funding the genesis
 // account (every node derives the same sender → identical genesis). Tests
 // sign MsgEthereumTx with it.
 func GenesisSenderKey() *ethsecp256k1.PrivKey {
-	seed := sha256.Sum256([]byte("monadbft-bridge-sender-seed-001"))
+	return DerivedSenderKey(-1)
+}
+
+// DerivedSenderKey — deterministic funded sender i (i<0 → the genesis
+// sender, preserved for existing tests). Every node derives the same keys
+// → identical genesis.
+func DerivedSenderKey(i int) *ethsecp256k1.PrivKey {
+	label := fmt.Sprintf("monadbft-bridge-sender-%d", i)
+	if i < 0 {
+		label = "monadbft-bridge-sender-seed-001"
+	}
+	seed := sha256.Sum256([]byte(label))
 	return &ethsecp256k1.PrivKey{Key: seed[:]}
 }
 
@@ -84,19 +99,27 @@ func evmdGenesisState(evmApp *evmd.EVMD, cfg EvmdConfig, vals []Validator) ([]by
 	// ethsecp256k1 so the account's SDK address equals its EVM address
 	// (tests can sign real MsgEthereumTx against it). Deterministic so
 	// every node's genesis is byte-identical.
-	senderPrivKey := GenesisSenderKey()
-	acc := authtypes.NewBaseAccount(senderPrivKey.PubKey().Address().Bytes(), senderPrivKey.PubKey(), 0, 0)
-	balance := banktypes.Balance{
-		Address: acc.GetAddress().String(),
-		Coins: sdk.NewCoins(sdk.NewCoin(
-			testconstants.ChainsCoinInfo[cfg.EVMChainID].Denom,
-			math.NewInt(9_000_000_000_000_000_000),
-		)),
+	keys := []*ethsecp256k1.PrivKey{GenesisSenderKey()}
+	for i := 0; i < cfg.FundedSenders; i++ {
+		keys = append(keys, DerivedSenderKey(i))
+	}
+	var accs []authtypes.GenesisAccount
+	var balances []banktypes.Balance
+	for _, k := range keys {
+		acc := authtypes.NewBaseAccount(k.PubKey().Address().Bytes(), k.PubKey(), 0, 0)
+		accs = append(accs, acc)
+		balances = append(balances, banktypes.Balance{
+			Address: acc.GetAddress().String(),
+			Coins: sdk.NewCoins(sdk.NewCoin(
+				testconstants.ChainsCoinInfo[cfg.EVMChainID].Denom,
+				math.NewInt(9_000_000_000_000_000_000),
+			)),
+		})
 	}
 
 	genesisState, err := simtestutil.GenesisStateWithValSet(
 		evmApp.AppCodec(), genesisState, CmtValidatorSet(vals),
-		[]authtypes.GenesisAccount{acc}, balance,
+		accs, balances...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("genesis valset: %w", err)

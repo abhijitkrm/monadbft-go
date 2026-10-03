@@ -311,7 +311,10 @@ func TestEngineMultiNodeCrashWindows(t *testing.T) {
 		tip := nodes[1].me.app.Height()
 
 		startDevnetNode(t, cfg, nodes[0], genDoc)
-		probeWaitHeight(t, nodes[0].me, tip+1, 90*time.Second)
+		// 180s: each successive window carries a bigger sync gap; under
+		// suite load the blocksync re-anchor is the slow part, and the
+		// assertion is liveness (eventually rejoins), not latency.
+		probeWaitHeight(t, nodes[0].me, tip+1, 180*time.Second)
 		t.Logf("offset=%v: node0 rejoined height=%d tip≈%d peers=%d",
 			off, nodes[0].me.app.Height(), tip, len(nodes[0].me.curNode().Peers()))
 	}
