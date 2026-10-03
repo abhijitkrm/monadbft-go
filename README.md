@@ -182,7 +182,23 @@ cd bridge && go build -o devnet ./cmd/devnet
     -transport tcp            # or raptorcast | none
 ./devnet start -o ./devnet-run -evmd /path/to/evmd
 #   → 4 evmd processes, prefixed logs, Ctrl-C stops all
-#   → metrics at 127.0.0.1:9100+i, JSON-RPC :8645+i, WS :8746+i
+#   → metrics at 127.0.0.1:9100+i, JSON-RPC :8645+i, WS :8746+i,
+#     CometBFT-compat RPC :36657+i (off 26657 to dodge real CometBFT)
+```
+
+### Soak — `devnet soak`
+
+Sustained-load evidence run: `init-files --fund N` writes N funded
+ethsecp256k1 accounts into genesis + `soak-keys.json`; `soak` then drives
+signed transfers at a target rate, samples per-node height/RSS/disk/
+apphash-parity, optionally SIGKILLs a node and times its rejoin, and ends
+with a post-load settle/drain check. JSON report at
+`<out>/soak-report.json`. See `docs/soak-findings.md` for current results
+and the two release-blocking defects it caught.
+
+```bash
+./devnet init-files -n 4 -o ./devnet-run -evmd /path/to/evmd --fund 8
+./devnet soak -o ./devnet-run -evmd /path/to/evmd     -duration 3m -rate 200 -kill 2 -kill-after 45s
 ```
 
 The generated fleet is single-host (all records advertise `-ip`,
