@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
+	cmttypes "github.com/cometbft/cometbft/types"
 	"github.com/cosmos/evm/evmd"
 
 	"github.com/abhijitkrm/monadbft-go/types"
@@ -45,6 +46,14 @@ type SpecApp struct {
 	bySeq map[int64]specEntry
 	byID  map[types.BlockId]int64
 
+	// valSets — the app validator set *after* each spec-executed height's
+	// updates (same indexing as App.valSets: valSets[h] validates h+1).
+	// DecidedLastCommit/NextValidatorsHash in a spec request must resolve
+	// the set at the block's own height, not the committed tip's: validator
+	// updates (jailing) applied between the tip and the spec depth
+	// otherwise produce timing-dependent requests and divergent app hashes.
+	valSets map[int64]*cmttypes.ValidatorSet
+
 	// async worker (NewAsyncSpecApp): SpecFinalize submits run off the
 	// caller's goroutine — FinalizeBlock is expensive enough to starve a
 	// consensus loop. Nil jobs channel = synchronous mode.
@@ -52,6 +61,11 @@ type SpecApp struct {
 	stop      chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+	// OnDone — invoked by the worker after every job completes (success or
+	// failure). Lets the ledger re-drive its pending queue: a failed job is
+	// retried on the next drain instead of leaving a permanent hole in the
+	// spec frontier, which would stall delayed-execution lookups forever.
+	OnDone func(blockID types.BlockId)
 }
 
 type specJob struct {
@@ -99,10 +113,11 @@ func newSpecApp(app *App, _ bool) *SpecApp {
 		return nil
 	}
 	return &SpecApp{
-		app:   app,
-		raw:   raw,
-		bySeq: map[int64]specEntry{},
-		byID:  map[types.BlockId]int64{},
+		app:     app,
+		raw:     raw,
+		bySeq:   map[int64]specEntry{},
+		byID:    map[types.BlockId]int64{},
+		valSets: map[int64]*cmttypes.ValidatorSet{},
 	}
 }
 
@@ -124,6 +139,9 @@ func (s *SpecApp) loop() {
 		select {
 		case j := <-s.jobs:
 			s.runSpec(context.Background(), j.req, j.blockID, j.parentID)
+			if s.OnDone != nil {
+				s.OnDone(j.blockID)
+			}
 		case <-s.stop:
 			for {
 				select {
@@ -141,6 +159,10 @@ func (s *SpecApp) loop() {
 // fork); callers fall back to synchronous execution on finalization.
 var ErrSpecNotChaining = fmt.Errorf("bridge: block does not chain onto spec tip")
 
+// ErrSpecQueueFull — async SpecFinalize could not enqueue the job. Callers
+// keep the block pending and retry on the next drain.
+var ErrSpecQueueFull = fmt.Errorf("bridge: spec job queue full")
+
 // SpecFinalize — execute req on the app at the spec tip. Must chain:
 // height == tip+1 and parentID == tipID. Caller supplies the consensus block
 // IDs (req.Hash is the block's own ID as the ledger already encodes). Async
@@ -149,10 +171,10 @@ func (s *SpecApp) SpecFinalize(ctx context.Context, req *abcitypes.RequestFinali
 	if s.jobs != nil {
 		select {
 		case s.jobs <- specJob{req, blockID, parentID}:
+			return nil, nil
 		default:
-			// queue full — canonical finalize will execute synchronously
+			return nil, ErrSpecQueueFull
 		}
-		return nil, nil
 	}
 	return s.runSpec(ctx, req, blockID, parentID)
 }
@@ -165,11 +187,17 @@ func (s *SpecApp) runSpec(ctx context.Context, req *abcitypes.RequestFinalizeBlo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.Height != s.tip+1 {
+		if DebugSpec != nil {
+			DebugSpec(blockID, req.Height, fmt.Errorf("h %d after tip %d", req.Height, s.tip))
+		}
 		return nil, fmt.Errorf("%w (height %d after tip %d)", ErrSpecNotChaining, req.Height, s.tip)
 	}
 	// tipID == GENESIS_BLOCK_ID (zero value) at the genesis tip, so the
 	// equality check covers height-1 parenting without a special case.
 	if parentID != s.tipID {
+		if DebugSpec != nil {
+			DebugSpec(blockID, req.Height, fmt.Errorf("parent %x vs tip %x", parentID[:4], s.tipID[:4]))
+		}
 		return nil, fmt.Errorf("%w (parent %x vs tip %x)", ErrSpecNotChaining, parentID[:4], s.tipID[:4])
 	}
 	// Revalidate against the live store tip: statesync replay advances the
@@ -180,6 +208,9 @@ func (s *SpecApp) runSpec(ctx context.Context, req *abcitypes.RequestFinalizeBlo
 	}
 	res, err := s.app.FinalizeBlock(ctx, req)
 	if err != nil {
+		if DebugSpec != nil {
+			DebugSpec(blockID, req.Height, err)
+		}
 		return nil, fmt.Errorf("bridge: spec FinalizeBlock h=%d: %w", req.Height, err)
 	}
 	if err := s.app.Commit(ctx); err != nil {
@@ -191,7 +222,38 @@ func (s *SpecApp) runSpec(ctx context.Context, req *abcitypes.RequestFinalizeBlo
 		txResults: res.TxResults, events: res.Events, blockID: blockID}
 	s.bySeq[req.Height] = e
 	s.byID[blockID] = req.Height
+	if base := s.valSetAfterLocked(req.Height - 1); base != nil {
+		if next, err := applyValUpdates(base, res.ValidatorUpdates); err == nil {
+			s.valSets[req.Height] = next
+		}
+	}
 	return res.AppHash, nil
+}
+
+// valSetAfter — the app validator set after height h's updates, resolved
+// across the canonical↔spec boundary: h ≤ committed comes from the app's
+// committed valSets, h > committed comes from the spec lineage's own fold.
+func (s *SpecApp) valSetAfter(h int64) *cmttypes.ValidatorSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.valSetAfterLocked(h)
+}
+
+func (s *SpecApp) valSetAfterLocked(h int64) *cmttypes.ValidatorSet {
+	if h <= s.app.committedHeight() {
+		return s.app.ValSetAt(h + 1)
+	}
+	return s.valSets[h]
+}
+
+// WouldChain — pre-flight chain check for the ledger's pending queue:
+// a job can only execute when the spec tip is exactly seq-1 and parented by
+// parentID. Submitting earlier only spins the worker (dequeue → reject →
+// re-queue), starving chainable jobs behind it in the FIFO.
+func (s *SpecApp) WouldChain(seq int64, parentID types.BlockId) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return seq == s.tip+1 && parentID == s.tipID
 }
 
 // SpecResultSeq — spec result at height h.
@@ -212,6 +274,13 @@ func (s *SpecApp) SpecResultID(blockID types.BlockId) (seq int64, appHash []byte
 		return 0, nil, nil, false
 	}
 	e := s.bySeq[h]
+	if e.blockID != blockID {
+		// bySeq[h] was overwritten by a different block at this height (fork
+		// lineage spec'd after this one) — the result for blockID is gone,
+		// so report a miss rather than another block's appHash.
+		delete(s.byID, blockID)
+		return 0, nil, nil, false
+	}
 	return h, e.appHash, e.updates, true
 }
 
@@ -245,6 +314,7 @@ func (s *SpecApp) CommittedResult(seq int64, blockID types.BlockId, parentID fun
 			if h <= seq {
 				delete(s.byID, pr.blockID)
 				delete(s.bySeq, h)
+				delete(s.valSets, h)
 			}
 		}
 		return e.appHash, e.updates, e.txResults, e.events, true
@@ -264,6 +334,7 @@ func (s *SpecApp) CommittedResult(seq int64, blockID types.BlockId, parentID fun
 		if h <= seq {
 			delete(s.byID, pr.blockID)
 			delete(s.bySeq, h)
+			delete(s.valSets, h)
 		}
 	}
 	return nil, nil, nil, nil, false
@@ -318,6 +389,7 @@ func (s *SpecApp) rewindLocked(h int64, tipID types.BlockId) error {
 		if seq > h {
 			delete(s.byID, e.blockID)
 			delete(s.bySeq, seq)
+			delete(s.valSets, seq)
 		}
 	}
 	s.tip = h
@@ -350,6 +422,10 @@ func (s *SpecApp) ResetToHeight(h int64, tipID types.BlockId) {
 	defer s.mu.Unlock()
 	s.bySeq = map[int64]specEntry{}
 	s.byID = map[types.BlockId]int64{}
+	s.valSets = map[int64]*cmttypes.ValidatorSet{}
 	s.tip = h
 	s.tipID = tipID
 }
+
+// DebugSpec — test-only hook for spec job outcomes (nil err = executed).
+var DebugSpec func(blockID types.BlockId, seq int64, err error)

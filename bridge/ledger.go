@@ -9,6 +9,7 @@ import (
 	"time"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
+	cmttypes "github.com/cometbft/cometbft/types"
 
 	"github.com/abhijitkrm/monadbft-go/blocksync"
 	"github.com/abhijitkrm/monadbft-go/cstypes"
@@ -48,6 +49,13 @@ type Ledger struct {
 	// lastPrune — last tip the disk pruner ran at (amortized every 512).
 	lastPrune types.SeqNum
 
+	// specInFlight — blockIDs with a job queued on the spec worker. Kept
+	// separate from pendingSpec: a queued job can still fail (chain check
+	// raced by a canonical commit), and the worker's OnDone clears the flag
+	// so the block becomes re-drainable. Deleting a pendingSpec entry only
+	// once SpecResultID confirms — never on enqueue — closes the hole where
+	// a lost job permanently froze the spec frontier.
+	specInFlight map[types.BlockId]bool
 	// pendingSpec — blocks awaiting speculative execution. A commit event
 	// can arrive before the spec frontier reaches the block's parent (a
 	// proposed block may be coherent before its parent is canonically
@@ -56,6 +64,13 @@ type Ledger struct {
 	pendingSpec map[types.BlockId]*cstypes.ConsensusFullBlock
 
 	events []glue.MonadEvent // queued EvBlockSyncSelfResponse
+
+	// reqCaps — diagnostic ring of the last-canonical FinalizeBlock requests
+	// per height, used by restart-replay tests to diff ABCI inputs across
+	// nodes. Populated in finalizeDirect only.
+	reqMu       sync.Mutex // guards reqCaps/reqCapsSpec (diag — own lock, not l.mu)
+	reqCaps     map[int64]*abcitypes.RequestFinalizeBlock
+	reqCapsSpec map[int64]*abcitypes.RequestFinalizeBlock
 
 	bs *store.BlockStore // durable block persistence; nil until AttachBlockStore
 
@@ -93,10 +108,25 @@ func NewLedger(app *App, spec *SpecApp) *Ledger {
 		committedByID: map[types.BlockId]types.SeqNum{},
 		certifiers:    map[types.BlockId]certifierEntry{},
 		pendingSpec:   map[types.BlockId]*cstypes.ConsensusFullBlock{},
+		specInFlight:  map[types.BlockId]bool{},
 		commitQ:       make(chan *cstypes.ConsensusFullBlock, 1024),
 		commitDone:    make(chan struct{}),
 	}
+	if spec != nil {
+		spec.OnDone = l.onSpecDone
+	}
 	return l
+}
+
+// onSpecDone — spec worker finished a job (any outcome): release the
+// in-flight mark and re-drive the pending queue. A successful job shows up
+// via SpecResultID on the drain; a failed one gets re-submitted — either
+// way the frontier can never be left waiting on a job that no longer exists.
+func (l *Ledger) onSpecDone(blockID types.BlockId) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.specInFlight, blockID)
+	l.drainSpec()
 }
 
 // SetRetain — bound the in-memory block maps to the last `keep` committed
@@ -506,26 +536,54 @@ func (l *Ledger) drainSpec() {
 		blockID := h.GetId()
 		if seq <= committed {
 			delete(l.pendingSpec, blockID)
+			delete(l.specInFlight, blockID)
 			continue
 		}
 		if _, _, _, ok := l.spec.SpecResultID(blockID); ok {
 			delete(l.pendingSpec, blockID)
+			delete(l.specInFlight, blockID)
 			continue
+		}
+		if l.specInFlight[blockID] {
+			continue // job already on the worker — OnDone re-drives us
+		}
+		if !l.spec.WouldChain(seq, h.GetParentId()) {
+			continue // can't chain at the current tip — retry on next drain
 		}
 		body, ok := b.Body.Inner.ExecutionBody.(*EvmBody)
 		if !ok {
 			delete(l.pendingSpec, blockID)
 			continue
 		}
-		_, err := l.spec.SpecFinalize(context.Background(), l.finalizeRequest(h, body.Txs), blockID, h.GetParentId())
-		if err == nil || errors.Is(err, ErrSpecNotChaining) {
-			if err == nil {
-				delete(l.pendingSpec, blockID)
-			}
-			continue
+		votesSet, nextSet := l.finalizeSets(seq, l.spec)
+		if votesSet == nil || nextSet == nil {
+			continue // sets not resolvable yet — retry on the next drain
 		}
-		// genuine execution error — drop; canonical finalize re-surfaces it
-		delete(l.pendingSpec, blockID)
+		req := l.finalizeRequest(h, body.Txs, votesSet, nextSet)
+		l.reqMu.Lock()
+		if l.reqCapsSpec == nil {
+			l.reqCapsSpec = map[int64]*abcitypes.RequestFinalizeBlock{}
+		}
+		l.reqCapsSpec[seq] = req
+		for old := range l.reqCapsSpec { // bounded diagnostic window
+			if old < seq-256 {
+				delete(l.reqCapsSpec, old)
+			}
+		}
+		l.reqMu.Unlock()
+		_, err := l.spec.SpecFinalize(context.Background(), req, blockID, h.GetParentId())
+		switch {
+		case err == nil:
+			// accepted by the async worker (or executed inline, in which
+			// case the SpecResultID check above confirms it next drain).
+			// Keep the entry pending — deleting here was the lost-job bug.
+			l.specInFlight[blockID] = true
+		case errors.Is(err, ErrSpecNotChaining), errors.Is(err, ErrSpecQueueFull):
+			// parent not spec'd yet, or worker busy — retry on next drain
+		default:
+			// genuine execution error — drop; canonical finalize re-surfaces it
+			delete(l.pendingSpec, blockID)
+		}
 	}
 	// bound the backlog — dead branches never chain
 	for len(l.pendingSpec) > 512 {
@@ -537,23 +595,48 @@ func (l *Ledger) drainSpec() {
 			}
 		}
 		delete(l.pendingSpec, lowest)
+		delete(l.specInFlight, lowest)
 	}
 }
 
 // finalizeRequest — the deterministic ABCI request for one consensus block
 // (identical for spec and canonical execution — that equality is what makes
 // delayed_execution_results verifiable).
-func (l *Ledger) finalizeRequest(h cstypes.ConsensusBlockHeader, txs [][]byte) *abcitypes.RequestFinalizeBlock {
+//
+// votesSet/nextSet must resolve the app validator set at the block's own
+// height, not the mutable tip: DecidedLastCommit is indexed by the set that
+// validated the parent (valSets[seq-2]), NextValidatorsHash by the set
+// validating this block (valSets[seq-1]). Callers pass the committed-side
+// ValSetAt or the spec lineage's valSetAfter — both resolve identically
+// for the same canonical height.
+func (l *Ledger) finalizeRequest(h cstypes.ConsensusBlockHeader, txs [][]byte,
+	votesSet, nextSet *cmttypes.ValidatorSet) *abcitypes.RequestFinalizeBlock {
 	blockID := h.GetId()
+	var nvHash []byte
+	if nextSet != nil {
+		nvHash = nextSet.Hash()
+	}
 	return &abcitypes.RequestFinalizeBlock{
 		Txs:                txs,
 		Height:             int64(h.SeqNum.Uint64()),
 		Time:               time.Unix(0, int64(h.TimestampNs.Uint64())),
 		ProposerAddress:    l.app.ConsAddr(h.Author),
-		DecidedLastCommit:  l.app.LastCommit(h.QC),
+		DecidedLastCommit:  l.app.LastCommitWith(h.QC, votesSet),
 		Hash:               blockID[:],
-		NextValidatorsHash: l.app.ValidatorsHash(),
+		NextValidatorsHash: nvHash,
 	}
+}
+
+// finalizeSets — the height-scoped validator sets for a request at seq:
+// the set that validated seq-1 (QC signers, DecidedLastCommit) and the set
+// validating seq (NextValidatorsHash). Canonical commits resolve from the
+// app's valSets; spec resolves across the canonical↔spec boundary via the
+// spec lineage's fold.
+func (l *Ledger) finalizeSets(seq int64, spec *SpecApp) (votesSet, nextSet *cmttypes.ValidatorSet) {
+	if spec != nil {
+		return spec.valSetAfter(seq - 2), spec.valSetAfter(seq - 1)
+	}
+	return l.app.ValSetAt(seq - 1), l.app.ValSetAt(seq)
 }
 
 // finalizeDirect — synchronous FinalizeBlock+Commit for one block (opMu
@@ -563,7 +646,20 @@ func (l *Ledger) finalizeDirect(block *cstypes.ConsensusFullBlock, body *EvmBody
 	seq := int64(h.SeqNum.Uint64())
 	l.app.opMu.Lock()
 	defer l.app.opMu.Unlock()
-	res, err := l.app.FinalizeBlock(context.Background(), l.finalizeRequest(h, body.Txs))
+	votesSet, nextSet := l.finalizeSets(seq, l.spec)
+	req := l.finalizeRequest(h, body.Txs, votesSet, nextSet)
+	l.reqMu.Lock()
+	if l.reqCaps == nil {
+		l.reqCaps = map[int64]*abcitypes.RequestFinalizeBlock{}
+	}
+	l.reqCaps[seq] = req
+	for old := range l.reqCaps { // bounded diagnostic window
+		if old < seq-256 {
+			delete(l.reqCaps, old)
+		}
+	}
+	l.reqMu.Unlock()
+	res, err := l.app.FinalizeBlock(context.Background(), req)
 	if err != nil {
 		panic(fmt.Sprintf("bridge: FinalizeBlock h=%d: %v", seq, err))
 	}

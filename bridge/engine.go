@@ -683,7 +683,7 @@ func (e *monadEngine) publishCommit(seq int64) {
 			"voting_power": strconv.FormatInt(v.VotingPower, 10),
 		}
 	}
-	votes := e.app.LastCommit(qc)
+	votes := e.app.LastCommitWith(qc, e.app.ValSetAt(int64(h.SeqNum.Uint64())-1))
 	votesJSON := make([]map[string]any, len(votes.Votes))
 	for i, v := range votes.Votes {
 		votesJSON[i] = map[string]any{

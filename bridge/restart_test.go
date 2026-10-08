@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -79,8 +80,50 @@ func probeWaitHeight(t *testing.T, me *monadEngine, h int64, d time.Duration) {
 		treeSize = cs.Consensus.PendingBlockTree.Size()
 		rootSeq = int(cs.Consensus.PendingBlockTree.RootSeqNum())
 	}
-	t.Fatalf("height %d not reached in %s: appH=%d storeH=%d specTip=%d committed=%d round=%d tree=%d rootSeq=%d err=%v\n%s",
-		h, d, me.app.Height(), me.app.StoreTip(), specTip, me.ledger.FinalizedBlocksLen(), round, treeSize, rootSeq, me.curNode().Err(),
+	var pendSpec, inFlight int
+	var inflightSeqs []int64
+	if me.ledger != nil {
+		me.ledger.mu.Lock()
+		pendSpec = len(me.ledger.pendingSpec)
+		inFlight = len(me.ledger.specInFlight)
+		for _, b := range me.ledger.pendingSpec {
+			inflightSeqs = append(inflightSeqs, int64(b.Header.SeqNum.Uint64()))
+		}
+		me.ledger.mu.Unlock()
+		sort.Slice(inflightSeqs, func(i, j int) bool { return inflightSeqs[i] < inflightSeqs[j] })
+		if len(inflightSeqs) > 12 {
+			inflightSeqs = append(inflightSeqs[:6], append([]int64{-1}, inflightSeqs[len(inflightSeqs)-6:]...)...)
+		}
+	}
+	// Ancestry probe: walk the high-QC's block ancestry — report each
+	// ancestor's presence in the tree and its coherence flag, so a stall
+	// shows whether it is a gap (missing block), a dead fork (incoherent),
+	// or a complete-but-unproven chain.
+	var ancestry []string
+	if cs := st.Consensus(); cs != nil && cs.Consensus != nil && cs.Consensus.PendingBlockTree != nil {
+		bt := cs.Consensus.PendingBlockTree
+		rootID := bt.Root().BlockId
+		id := cs.Consensus.Pacemaker.HighCertificate().GetQC().GetBlockId()
+		for i := 0; i < 24; i++ {
+			if id == rootID {
+				ancestry = append(ancestry, "ROOT")
+				break
+			}
+			b := bt.GetBlock(id)
+			if b == nil {
+				ancestry = append(ancestry, fmt.Sprintf("MISSING id=%x", id[:4]))
+				break
+			}
+			ancestry = append(ancestry, fmt.Sprintf("seq=%d coh=%v", b.GetSeqNum(), bt.IsCoherent(id)))
+			parent := b.Header.QC.GetBlockId()
+			if parent == id {
+				break
+			}
+			id = parent
+		}
+	}
+	t.Fatalf("height %d not reached in %s: appH=%d storeH=%d specTip=%d committed=%d round=%d tree=%d rootSeq=%d pendSpec=%d inFlight=%d specSeqs=%v ancestry=%v err=%v\n%s",
+		h, d, me.app.Height(), me.app.StoreTip(), specTip, me.ledger.FinalizedBlocksLen(), round, treeSize, rootSeq, pendSpec, inFlight, inflightSeqs, ancestry, me.curNode().Err(),
 		strings.Join(nonzero, "\n"))
 }
 

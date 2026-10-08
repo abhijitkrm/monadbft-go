@@ -49,41 +49,59 @@ resolved `LatestVersion` ahead of the materialized IAVL trees →
 **Verification**: two subsequent 180s soaks at 200 tx/s — **zero
 panics** (previously 2 crashes in comparable windows).
 
-### 2. Post-restart commit "stall" — **diagnosed: slashing jail**
+### 2. Post-restart commit stall — **root-caused, fixed**
 
-SIGKILLed node restarts, replays WAL/watermarks, reconnects to all 3
-peers, receives proposals and votes, forms QCs, fetches blocksync
-payloads — then `commit_block` stops permanently.
+SIGKILLed node restarts, replays WAL/watermarks, reconnects, fetches
+blocksync payloads — then `commit_block` stops permanently while rounds
+churn via TCs. Three compounding defects were found and fixed, verified
+by an in-process 4-node reproduction
+(`TestEngineMultiNodeRestartUnderLoad`, ~50% failure → deterministic
+pass):
 
-**Root cause**: `x/slashing` jails the validator for liveness.
-`signed_blocks_window=100`, `min_signed_per_window=0.5`, and at ~3
-blocks/s a ~10s restart misses enough blocks to jail once the rolling
-window fills — logs show
-`slashing and jailing validator due to liveness fault ... jailed_until`.
-The node keeps gossiping but is out of the valset, so it emits no
-commits — correct-by-design behavior, not a consensus defect. After
-`downtime_jail_duration` (600s) it would unjail and have to catch up.
+1. **Speculative job loss** — the async spec worker dropped jobs when
+   its queue was full or when a chain-check raced a canonical commit;
+   `drainSpec` treated enqueue as execution and retired the pending
+   entry, leaving a permanent hole in the spec frontier →
+   `ErrNotAvailableYet` → `rx_execution_lagging` → livelock. Fixed by
+   keeping pending entries until `SpecResultID` confirms and re-driving
+   the queue on every worker completion (`OnDone`), plus a `WouldChain`
+   pre-flight to avoid busy spin-retries.
+2. **Stale speculative index** — `SpecResultID` returned `bySeq[h]`
+   without checking the entry's block ID, so a fork at the same height
+   could serve the wrong appHash into a proposal (permanently
+   incoherent block). Fixed: stale mapping → honest miss.
+3. **Validator-set timing nondeterminism** (the deep one) —
+   `finalizeRequest` built `DecidedLastCommit` and `NextValidatorsHash`
+   from `a.appSet`, the *tip-scoped* mutable set. Spec execution races
+   commits, so the same canonical block produced different requests
+   depending on how many validator updates (e.g. the restarted node's
+   own slashing-jail removal) had applied when the request was built —
+   replayed heights diverged in exactly `distribution`+`staking` state
+   (vote-reward allocation), then the blocktree rejected live
+   proposals' embedded results → permanent incoherence. Captured live:
+   peers' spec request for block 102 carried 4 votes (with the killed
+   node ABSENT), node0's carried 3. Fixed by height-scoping:
+   `DecidedLastCommit` resolves the set validating `seq-1`
+   (`valSets[seq-2]`), `NextValidatorsHash` the set validating `seq`
+   (`valSets[seq-1]`); `SpecApp` now folds validator updates along its
+   own lineage (`spec.valSets`) so spec requests resolve identically
+   across the canonical↔spec boundary. Same fix applied to
+   `PrepareProposal` (`LocalLastCommit`/`NextValidatorsHash`) and the
+   informational `commitJSON`/`dump_consensus_state` vote rendering.
 
-Operational notes for real devnets:
-- kill/restart drills on live devnets will jail validators — expected.
-- Whether a jailed node should still *follow* the chain (execute
-  commits without voting) rather than freeze is an engine behavior
-  question — currently it stops committing entirely, so post-unjail it
-  must blocksync the gap.
-- For longer restart tests, `-kill-after` timing vs the 100-block
-  window determines whether the node gets jailed before the run ends.
+Also note (operational, not a bug): `x/slashing` does jail the
+restarted validator (`signed_blocks_window=100` at ~3 blk/s) — its
+validator update is what fed defect 3.
 
-### 3. App-hash divergence at restored height — **likely artifact, watch**
+### 3. App-hash divergence at restored height — **confirmed real, fixed**
 
-At the stuck node's last persisted height, `/block?height=81` returned the
-**same block hash** as peers but a **different `app_hash`**
-(`BBF33F4E…` vs peers' `5346FA10…`). The RPC synthesizes `app_hash` from
-the local result store — the leading explanation is a deferred-exec
-phase artifact (stalled node's result at h reflects a different
-replay/finalization phase than peers' settled values), not consensus
-divergence: block hashes matched and the soak's sampled parity check
-reported `parity=True` at equal heights in every run. Worth one
-verification pass on the next soak before closing.
+The same-block-ID/different-`app_hash` seen in soak was *not* a
+cosmetic artifact — it was defect 3 above: replayed canonical blocks
+produced divergent distribution/staking state on the restarted node.
+Per-store commit-hash comparison localized the divergence; the request
+capture (`reqCaps`) diffed the exact `RequestFinalizeBlock` fields.
+After the height-scoping fix the restarted node's apphash matches
+peers at every height across repeated runs.
 
 ### 4. Fleet-wide freeze at h=184 — **seen once, not reproduced**
 

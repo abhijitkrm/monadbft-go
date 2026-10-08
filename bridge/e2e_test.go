@@ -134,8 +134,14 @@ func TestEvmIntegrityTransfers(t *testing.T) {
 		}
 	}
 
-	// Cross-node determinism: identical app hashes at every height.
-	for h := int64(1); h <= nodes[0].me.app.Height(); h++ {
+	// Cross-node determinism: identical app hashes at every height. Snapshot
+	// the tip first — nodes keep committing during the comparison, so a live
+	// bound would read heights a lagging node has not committed (Result → nil).
+	tip := nodes[0].me.app.Height()
+	for _, dn := range nodes {
+		probeWaitHeight(t, dn.me, tip, 60*time.Second)
+	}
+	for h := int64(1); h <= tip; h++ {
 		ref := nodes[0].me.app.Result(h).AppHash
 		for i := 1; i < len(nodes); i++ {
 			if got := nodes[i].me.app.Result(h).AppHash; !bytes.Equal(ref, got) {

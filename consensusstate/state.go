@@ -1053,6 +1053,9 @@ func (s *State) tryVote(
 
 	if !s.Consensus.PendingBlockTree.IsCoherent(tip.BlockHeader.GetId()) {
 		// not voting on proposal — not coherent
+		if DebugProposal != nil {
+			DebugProposal("vote-incoherent-tip", fmt.Sprintf("round=%d seq=%d", proposalRound, tip.BlockHeader.SeqNum))
+		}
 		return cmds
 	}
 
@@ -1210,6 +1213,9 @@ func (s *State) tryPropose() []Command {
 	cmds = append(cmds, s.tryUpdateCoherency(qc.GetBlockId())...)
 	if !s.Consensus.PendingBlockTree.IsCoherent(qc.GetBlockId()) {
 		// qc.block_id not coherent — can't propose
+		if DebugProposal != nil {
+			DebugProposal("propose-incoherent-qc", fmt.Sprintf("round=%d qcround=%d rootseq=%d", round, qc.GetRound(), s.Consensus.PendingBlockTree.RootSeqNum()))
+		}
 		return cmds
 	}
 
@@ -1240,6 +1246,9 @@ func (s *State) tryPropose() []Command {
 	if err != nil {
 		// no execution result found, can't propose — execution lagging
 		s.Metrics.ConsensusEvents.RxExecutionLagging.Inc()
+		if DebugProposal != nil {
+			DebugProposal("exec-lagging", fmt.Sprintf("round=%d seq=%d pend=%d err=%v", round, tryProposeSeqNum, len(pendingBlocks), err))
+		}
 		return cmds
 	}
 
@@ -1338,3 +1347,7 @@ func (s *State) lookupLeader(round types.Round) *types.NodeId {
 	leader := s.Election.GetLeader(round, validatorSet)
 	return &leader
 }
+
+// DebugProposal — test-only hook for proposal/vote gating failures.
+// Called with a tag and detail when tryPropose/tryVote bail out early.
+var DebugProposal func(tag string, detail string)

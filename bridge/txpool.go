@@ -108,8 +108,8 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 		Height:             t.app.StoreTip() + 1,
 		Time:               time.Unix(0, int64(c.TimestampNs.Uint64())),
 		ProposerAddress:    t.app.ConsAddr(c.NodeId),
-		LocalLastCommit:    t.app.LocalLastCommit(c.HighQC),
-		NextValidatorsHash: t.app.ValidatorsHash(),
+		LocalLastCommit:    t.app.LocalLastCommitWith(c.HighQC, t.app.ValSetAt(int64(c.SeqNum)-1)),
+		NextValidatorsHash: t.app.valSetHashAt(int64(c.SeqNum)),
 	})
 	t.app.opMu.Unlock()
 	if err != nil {

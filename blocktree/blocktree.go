@@ -517,6 +517,8 @@ func (t *BlockTree) TryUpdateCoherency(
 			t.tree[nextId].IsCoherent = true
 			out = append(out, nextBlock)
 			queue = append(queue, t.tree[nextId].ChildrenBlocks...)
+		} else if DebugCoherency != nil {
+			DebugCoherency(nextBlock.GetSeqNum(), err)
 		}
 	}
 	return out
@@ -785,3 +787,7 @@ func (t *BlockTree) GetCanonicalCoherentTip(highCertQc *cstypes.QuorumCertificat
 	}
 	return coherentTip
 }
+
+// DebugCoherency — test-only hook: called when CheckCoherency fails inside
+// TryUpdateCoherency (seq, err). Nil in production.
+var DebugCoherency func(seq types.SeqNum, err error)

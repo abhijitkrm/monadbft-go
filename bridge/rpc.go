@@ -299,7 +299,7 @@ func (s *RPCServer) blockJSON(fb *cstypes.ConsensusFullBlock) map[string]any {
 func (s *RPCServer) commitJSON(fb *cstypes.ConsensusFullBlock) map[string]any {
 	h := fb.Header
 	qc := h.QC
-	votes := s.app.LastCommit(qc)
+	votes := s.app.LastCommitWith(qc, s.app.ValSetAt(int64(h.SeqNum.Uint64())-1))
 	sigs := make([]map[string]any, len(votes.Votes))
 	for i, v := range votes.Votes {
 		flag := "1"

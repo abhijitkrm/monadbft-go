@@ -3,24 +3,36 @@
 package bridge
 
 import (
+	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	abcitypes "github.com/cometbft/cometbft/abci/types"
 	cmtcfg "github.com/cometbft/cometbft/config"
 	cmted25519 "github.com/cometbft/cometbft/crypto/ed25519"
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/privval"
 	cmttypes "github.com/cometbft/cometbft/types"
 	dbm "github.com/cosmos/cosmos-db"
+	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 
+	"github.com/abhijitkrm/monadbft-go/blocktree"
+	"github.com/abhijitkrm/monadbft-go/consensusstate"
 	"github.com/abhijitkrm/monadbft-go/node"
+	"github.com/abhijitkrm/monadbft-go/types"
+
+	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/cosmos/evm/engine"
 	testconstants "github.com/cosmos/evm/testutil/constants"
@@ -277,6 +289,252 @@ func runMultiNodeRestart(t *testing.T, transport string) {
 	// blocksync from live peers to the moving tip.
 	startDevnetNode(t, cfg, nodes[0], genDoc)
 	probeWaitHeight(t, nodes[0].me, tip+2, 90*time.Second)
+	for i := range nodes {
+		t.Logf("node %d height=%d", i, nodes[i].me.app.Height())
+	}
+}
+
+// TestEngineMultiNodeRestartUnderLoad — the soak-observed stall: a node
+// restarted under sustained tx load must blocksync-fill the missed-block
+// gap and resume committing. The plain restart test only lags ~6 empty
+// blocks; here the fleet runs ~30 loaded blocks ahead so the rejoin
+// exercises the coherence/blocksync path under real execution pressure.
+func TestEngineMultiNodeRestartUnderLoad(t *testing.T) {
+	const n = 4
+	blocktree.DebugCoherency = func(seq types.SeqNum, err error) {
+		t.Logf("COHERENCY-FAIL seq=%d err=%v", seq, err)
+	}
+	consensusstate.DebugProposal = func(tag, detail string) {
+		t.Logf("PROPOSE-GATE %s %s", tag, detail)
+	}
+	specFails := 0
+	DebugSpec = func(blockID types.BlockId, seq int64, err error) {
+		if err != nil && specFails < 40 {
+			specFails++
+			t.Logf("SPEC-FAIL seq=%d id=%x err=%v", seq, blockID[:4], err)
+		}
+	}
+	t.Cleanup(func() { blocktree.DebugCoherency = nil; consensusstate.DebugProposal = nil; DebugSpec = nil })
+	nodes, _, cfg, genDoc := bringUpDevnet(t, "probe-restartload", "tcp", 0, 8)
+	defer logPeerCounts(t, nodes)
+	for i := range nodes {
+		probeWaitHeight(t, nodes[i].me, 4, 60*time.Second)
+	}
+
+	txCfg := nodes[0].me.app.Raw().TxConfig()
+	to := common.HexToAddress("0x00000000000000000000000000000000aa55aa55")
+
+	// Snapshot node0's result hashes before the kill — the post-restart
+	// divergence check distinguishes live-exec nondeterminism from
+	// replay/restore pollution.
+	preKill := map[int64][]byte{}
+	{
+		h := nodes[0].me.app.Height()
+		for x := int64(1); x <= h; x++ {
+			if r := nodes[0].me.app.Result(x); r != nil {
+				preKill[x] = r.AppHash
+			}
+		}
+		for i := 1; i < n; i++ {
+			if r := nodes[i].me.app.Result(h); r != nil && !bytes.Equal(preKill[h], r.AppHash) {
+				t.Fatalf("pre-kill divergence at h=%d", h)
+			}
+		}
+	}
+
+	// Stop node0; drive continuous load through node1 while peers advance.
+	nodes[0].stop(t)
+	stopLoad := make(chan struct{})
+	go func() {
+		senders := 8
+		per := make([]uint64, senders)
+		var i uint64
+		// ~150 tx/s — soak-realistic; unthrottled blasting starves the
+		// consensus loop on mempool/exec contention (fleet freeze).
+		tick := time.NewTicker(7 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stopLoad:
+				return
+			case <-tick.C:
+			}
+			si := int(i % uint64(senders))
+			i++
+			bz, _ := makeEthTx(t, txCfg, DerivedSenderKey(si), per[si], to, 1)
+			per[si]++
+			if _, err := nodes[1].me.client.BroadcastTxSync(
+				context.Background(), bz); err != nil {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	}()
+	defer close(stopLoad)
+
+	for i := 1; i < n; i++ {
+		probeWaitHeight(t, nodes[i].me, 100, 180*time.Second)
+	}
+	tip := nodes[1].me.app.Height()
+
+	// Restart node0: resume, blocksync the ~95-block gap, rejoin.
+	startDevnetNode(t, cfg, nodes[0], genDoc)
+	probeWaitHeight(t, nodes[0].me, tip+2, 180*time.Second)
+	// Stronger than tip+2: the node must close to the LIVE moving tip —
+	// the soak stall signature was "caught up most of the way then froze".
+	live := nodes[1].me.app.Height()
+	// manual wait so a stall can dump per-node result divergence at the
+	// stuck height before probeWaitHeight's Fatalf fires
+	deadline := time.Now().Add(180 * time.Second)
+	for time.Now().Before(deadline) && nodes[0].me.app.Height() < live {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if nodes[0].me.app.Height() < live {
+		stuck := nodes[0].me.app.Height()
+		// find first divergent height across the committed range
+		var firstDiverged int64 = -1
+		for h := int64(1); h <= stuck && firstDiverged < 0; h++ {
+			var ref0 []byte
+			for i := range nodes {
+				r := nodes[i].me.app.Result(h)
+				if r == nil {
+					break
+				}
+				if ref0 == nil {
+					ref0 = r.AppHash
+				} else if !bytes.Equal(ref0, r.AppHash) {
+					firstDiverged = h
+					// request diff — which ABCI input field differed per node
+					var reqs []*abcitypes.RequestFinalizeBlock
+					for j := range nodes {
+						nodes[j].me.ledger.reqMu.Lock()
+						reqs = append(reqs, nodes[j].me.ledger.reqCaps[h])
+						nodes[j].me.ledger.reqMu.Unlock()
+					}
+					for j := range reqs {
+						nodes[j].me.ledger.reqMu.Lock()
+						sr := nodes[j].me.ledger.reqCapsSpec[h]
+						nodes[j].me.ledger.reqMu.Unlock()
+						var vdesc string
+						if sr != nil {
+							var fl []string
+							for _, v := range sr.DecidedLastCommit.Votes {
+								fl = append(fl, fmt.Sprintf("%s:%x", v.BlockIdFlag.String()[13:], v.Validator.Address[:4]))
+							}
+							vdesc = fmt.Sprintf(" votes=[%s] prop=%x nvh=%x", strings.Join(fl, ","), sr.ProposerAddress[:6], sr.NextValidatorsHash[:6])
+						}
+						t.Logf("REQCAP h=%d n%d direct=%v spec=%v%s", h, j, reqs[j] != nil, sr != nil, vdesc)
+					}
+					if reqs[0] != nil && reqs[1] != nil {
+						r0, r1 := reqs[0], reqs[1]
+						t.Logf("REQDIFF h=%d: proposer %x vs %x | time %d vs %d | nvHash %x vs %x | votes %d vs %d | commitRound %d vs %d | txs %d vs %d",
+							h, r0.ProposerAddress, r1.ProposerAddress,
+							r0.Time.UnixNano(), r1.Time.UnixNano(),
+							r0.NextValidatorsHash[:8], r1.NextValidatorsHash[:8],
+							len(r0.DecidedLastCommit.Votes), len(r1.DecidedLastCommit.Votes),
+							r0.DecidedLastCommit.Round, r1.DecidedLastCommit.Round,
+							len(r0.Txs), len(r1.Txs))
+						for vi := 0; vi < len(r0.DecidedLastCommit.Votes) && vi < len(r1.DecidedLastCommit.Votes); vi++ {
+							v0, v1 := r0.DecidedLastCommit.Votes[vi], r1.DecidedLastCommit.Votes[vi]
+							same := v0.BlockIdFlag == v1.BlockIdFlag && bytes.Equal(v0.Validator.Address, v1.Validator.Address) && v0.Validator.Power == v1.Validator.Power
+							t.Logf("REQDIFF h=%d vote[%d] n0=%s@%x p%d | n1=%s@%x p%d same=%v", h, vi,
+								v0.BlockIdFlag, v0.Validator.Address[:6], v0.Validator.Power,
+								v1.BlockIdFlag, v1.Validator.Address[:6], v1.Validator.Power, same)
+						}
+					}
+					for j := range nodes {
+						_, bid, _, _, _, _, _ := nodes[j].me.app.CommittedEntry(h)
+						cb := nodes[j].me.ledger.committedBlock(types.SeqNum(h))
+						var qcSig string
+						var flags string
+						if cb != nil {
+							q := cb.Header.QC
+							qcSig = fmt.Sprintf("signers=%v len=%d", q.Signatures.Signers.Bits, q.Signatures.Signers.Len())
+							ci := nodes[j].me.app.LastCommit(q)
+							var f []string
+							for _, v := range ci.Votes {
+								f = append(f, v.BlockIdFlag.String())
+							}
+							flags = strings.Join(f, ",")
+						}
+						t.Logf("BLOCKID h=%d n%d=%x qc[%s] votes=[%s]", h, j, bid[:12], qcSig, flags)
+					}
+				}
+			}
+		}
+		for h := int64(1); h <= stuck; h++ {
+			var row string
+			diverged := false
+			var ref []byte
+			for i := range nodes {
+				r := nodes[i].me.app.Result(h)
+				if r == nil {
+					row += fmt.Sprintf(" n%d=nil", i)
+					continue
+				}
+				row += fmt.Sprintf(" n%d=%x", i, r.AppHash[:6])
+				if ref == nil {
+					ref = r.AppHash
+				} else if !bytes.Equal(ref, r.AppHash) {
+					diverged = true
+				}
+			}
+			if diverged {
+				// tx-result comparison — if tx exec matches, divergence is
+				// in begin/end-block module state (rewards, liveness), not txs
+				if h == firstDiverged {
+					for i := range nodes {
+						if _, _, _, txr, ev, _, ok := nodes[i].me.app.CommittedEntry(h); ok {
+							var tr []string
+							for _, r := range txr {
+								tr = append(tr, fmt.Sprintf("%d:%d", r.Code, r.GasUsed))
+							}
+							evs := map[string]int{}
+							for _, e := range ev {
+								evs[e.Type]++
+							}
+							var types_ []string
+							for et, c := range evs {
+								types_ = append(types_, fmt.Sprintf("%s x%d", et, c))
+							}
+							sort.Strings(types_)
+							t.Logf("TXRES h=%d n%d codes/gas=[%s] events=%d [%s]", h, i, strings.Join(tr, ","), len(ev), strings.Join(types_, "; "))
+						}
+					}
+				}
+				// per-store commit hash — localize which module's state diverged
+				if h == firstDiverged {
+					for i := range nodes {
+						raw := nodes[i].me.app.Raw()
+						if rms, ok := raw.CommitMultiStore().(interface {
+							GetCommitInfo(int64) (*storetypes.CommitInfo, error)
+						}); ok {
+							if ci, err := rms.GetCommitInfo(h); err == nil && ci != nil {
+								var sr []string
+								for _, si := range ci.StoreInfos {
+									sr = append(sr, fmt.Sprintf("%s=%x", si.Name, si.CommitId.Hash[:4]))
+								}
+								t.Logf("STORES h=%d n%d %s", h, i, strings.Join(sr, " "))
+							}
+						}
+					}
+				}
+				var vrow string
+				for i := range nodes {
+					if vs := nodes[i].me.app.ValSetAt(h); vs != nil {
+						vrow += fmt.Sprintf(" n%d=%x", i, vs.Hash()[:6])
+					} else {
+						vrow += fmt.Sprintf(" n%d=nil", i)
+					}
+				}
+				row += " | valset" + vrow
+				if pk, ok := preKill[h]; ok {
+					row += fmt.Sprintf(" prekill=%x sameaspre=%v", pk[:6], bytes.Equal(pk, nodes[0].me.app.Result(h).AppHash))
+				}
+				t.Logf("DIVERGENCE h=%d%s", h, row)
+			}
+		}
+	}
+	probeWaitHeight(t, nodes[0].me, live, 10*time.Second)
 	for i := range nodes {
 		t.Logf("node %d height=%d", i, nodes[i].me.app.Height())
 	}

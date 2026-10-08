@@ -641,11 +641,25 @@ func (a *App) fillValSetGap(h int64) {
 // The genesis QC carries no signers — height-1 FinalizeBlock gets an empty
 // CommitInfo, matching CometBFT.
 func (a *App) LastCommit(qc cstypes.QuorumCertificate) abcitypes.CommitInfo {
-	if a.appSet == nil || qc.Signatures.Signers.Len() == 0 {
+	a.mu.Lock()
+	vs := a.appSet
+	a.mu.Unlock()
+	return a.LastCommitWith(qc, vs)
+}
+
+// LastCommitWith — LastCommit indexed by an explicit validator set. The
+// caller resolves the height-appropriate set (the set that validated the
+// QC's block): using the mutable appSet makes requests timing-dependent —
+// spec execution races commits, so the same canonical block produced
+// different DecidedLastCommit depending on how many validator updates had
+// applied when the request was built (observed as divergent
+// distribution/staking state roots across nodes).
+func (a *App) LastCommitWith(qc cstypes.QuorumCertificate, vs *cmttypes.ValidatorSet) abcitypes.CommitInfo {
+	if vs == nil || qc.Signatures.Signers.Len() == 0 {
 		return abcitypes.CommitInfo{Round: int32(qc.Info.Round)}
 	}
-	votes := make([]abcitypes.VoteInfo, len(a.appSet.Validators))
-	for i, v := range a.appSet.Validators {
+	votes := make([]abcitypes.VoteInfo, len(vs.Validators))
+	for i, v := range vs.Validators {
 		flag := cmtproto.BlockIDFlagAbsent
 		if mi, ok := a.byCons[string(v.Address)]; ok &&
 			mi < qc.Signatures.Signers.Len() && qc.Signatures.Signers.Bits[mi] {
@@ -663,11 +677,20 @@ func (a *App) LastCommit(qc cstypes.QuorumCertificate) abcitypes.CommitInfo {
 // (same signer bitmap, empty vote extensions — the milestone does not use
 // vote extensions).
 func (a *App) LocalLastCommit(qc cstypes.QuorumCertificate) abcitypes.ExtendedCommitInfo {
-	if a.appSet == nil || qc.Signatures.Signers.Len() == 0 {
+	a.mu.Lock()
+	vs := a.appSet
+	a.mu.Unlock()
+	return a.LocalLastCommitWith(qc, vs)
+}
+
+// LocalLastCommitWith — LocalLastCommit indexed by an explicit validator
+// set (see LastCommitWith).
+func (a *App) LocalLastCommitWith(qc cstypes.QuorumCertificate, vs *cmttypes.ValidatorSet) abcitypes.ExtendedCommitInfo {
+	if vs == nil || qc.Signatures.Signers.Len() == 0 {
 		return abcitypes.ExtendedCommitInfo{Round: int32(qc.Info.Round)}
 	}
-	votes := make([]abcitypes.ExtendedVoteInfo, len(a.appSet.Validators))
-	for i, v := range a.appSet.Validators {
+	votes := make([]abcitypes.ExtendedVoteInfo, len(vs.Validators))
+	for i, v := range vs.Validators {
 		flag := cmtproto.BlockIDFlagAbsent
 		if mi, ok := a.byCons[string(v.Address)]; ok &&
 			mi < qc.Signatures.Signers.Len() && qc.Signatures.Signers.Bits[mi] {
@@ -698,6 +721,14 @@ func (a *App) ValidatorsHash() []byte {
 		return nil
 	}
 	return a.appSet.Hash()
+}
+
+// valSetHashAt — hash of the set validating height h (nil when unresolved).
+func (a *App) valSetHashAt(h int64) []byte {
+	if vs := a.ValSetAt(h); vs != nil {
+		return vs.Hash()
+	}
+	return nil
 }
 
 // ValidatorSetData — the MonadBFT validator set for the app's current
