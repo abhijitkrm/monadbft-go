@@ -68,7 +68,13 @@ type EngineConfig struct {
 	// Optional for single-validator chains (self-binding derives).
 	ValidatorsFile string `json:"validators_file"`
 
-	ExecutionDelay     uint64 `json:"execution_delay"`     // ≥2
+	ExecutionDelay uint64 `json:"execution_delay"` // ≥3 final, ≥2 speculative
+	// ExecutionMode — "final" (default): the app executes finalized blocks
+	// only and proposals embed the latest finalized result ≤ seq-delay
+	// (FinalOnlyPolicy). "speculative": the legacy SpecApp path (executes
+	// QC'd blocks on the app store, rolls back orphans; fixed seq-delay
+	// results). Consensus-critical: all validators MUST agree.
+	ExecutionMode      string `json:"execution_mode"`
 	DeltaMs            int    `json:"delta_ms"`            // round timer base (default 400)
 	EpochLength        uint64 `json:"epoch_length"`        // valset boundary (default: never)
 	StatesyncThreshold uint64 `json:"statesync_threshold"` // blocks behind → statesync (default 1000)
@@ -93,6 +99,11 @@ type EngineConfig struct {
 	// RPCAddr — CometBFT-compat JSON-RPC listen address ("host:port").
 	// Empty = use config.toml rpc.laddr; "off" disables the surface.
 	RPCAddr string `json:"rpc_addr"`
+	// RPCRatePerSec / RPCRateBurst — per-IP request limit on the RPC shim.
+	// 0 = default (60/s, burst 120); negative disables limiting (only for
+	// a loopback-bound RPC on a trusted host, e.g. benchmarking).
+	RPCRatePerSec float64 `json:"rpc_rate_per_sec"`
+	RPCRateBurst  int     `json:"rpc_rate_burst"`
 
 	// RaptorCast/peerdisc fleet tuning (upstream devnet defaults apply).
 	MaxNumPeers  int `json:"max_num_peers"`  // peerdisc cap (default 200)
@@ -117,11 +128,18 @@ type EngineConfig struct {
 	PeerdiscRefreshMs int `json:"peerdisc_refresh_ms"`
 }
 
+// Execution modes (EngineConfig.ExecutionMode).
+const (
+	ExecModeFinal       = "final"
+	ExecModeSpeculative = "speculative"
+)
+
 // DefaultEngineConfig — sane single-node defaults.
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
 		Transport:          "none",
-		ExecutionDelay:     4,
+		ExecutionDelay:     5,
+		ExecutionMode:      ExecModeFinal,
 		DeltaMs:            400,
 		StatesyncThreshold: 1000,
 		RetainBlocks:       4096,
@@ -142,8 +160,19 @@ func (c EngineConfig) Validate() error {
 	if c.DeltaMs <= 0 || c.DeltaMs > 60_000 {
 		return fmt.Errorf("delta_ms %d out of range (0, 60000]", c.DeltaMs)
 	}
-	if c.ExecutionDelay < 2 {
-		return fmt.Errorf("execution_delay must be ≥2 (seq-1 cannot speculate safely)")
+	switch c.ExecutionMode {
+	case "", ExecModeFinal:
+		// finalization trails proposals by 2 seqs, so delay-2 is the
+		// execution slack; 3 leaves one block of headroom.
+		if c.ExecutionDelay < 3 {
+			return fmt.Errorf("execution_delay must be ≥3 in final execution mode")
+		}
+	case ExecModeSpeculative:
+		if c.ExecutionDelay < 2 {
+			return fmt.Errorf("execution_delay must be ≥2 (seq-1 cannot speculate safely)")
+		}
+	default:
+		return fmt.Errorf("unknown execution_mode %q (final|speculative)", c.ExecutionMode)
 	}
 	// statesync thresholds decompose into StartExecution = thr/2,
 	// StatesyncToLive = thr, LiveToStatesync = 3thr/2 — a threshold below
@@ -444,10 +473,14 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	// restart (the ledger's block index and the app's result index are the
 	// durable state the restarted node re-attaches to).
 	dataDir := filepath.Join(root, "data", "monadbft")
-	spec := NewAsyncSpecApp(bapp)
+	var spec *SpecApp // nil → final-only execution
+	if cfg.ExecutionMode == ExecModeSpeculative {
+		spec = NewAsyncSpecApp(bapp)
+	}
 	ledger := NewLedger(bapp, spec)
 	ledger.SetRetain(types.SeqNum(cfg.RetainBlocks), types.SeqNum(cfg.PruneKeepBlocks))
 	pool := NewTxPool(bapp)
+	pool.SetLedger(ledger)
 	pool.SetFeeParams(cfg.BaseFee, 0, 0)
 	epochLen := types.SeqNum(cfg.EpochLength)
 	if cfg.EpochLength == 0 {
@@ -519,7 +552,7 @@ func Start(opts engine.Options) (engine.Engine, error) {
 				TimestampLatencyEstimateNs: types.U128FromUint64(uint64(cfg.TimestampLatencyMs) * 1_000_000),
 			},
 			BlockValidator:         NewEvmBlockValidator(raw.TxConfig().TxDecoder(), ethChainID(raw)),
-			BlockPolicy:            blocktree.NewEvmBlockPolicy(delay, cfg.BaseFee, 0, 0),
+			BlockPolicy:            newBlockPolicy(spec != nil, delay, cfg.BaseFee, 0, 0),
 			StateRead:              NewStateRead(bapp, spec),
 			GenesisValidators:      vsd,
 			StatesyncExpandToGroup: true,
@@ -580,6 +613,7 @@ func Start(opts engine.Options) (engine.Engine, error) {
 	}
 	if laddr != "" && laddr != "off" {
 		srv := NewRPCServer(bapp, ledger, pool, selfID, genDoc.ChainID)
+		srv.SetRateLimit(cfg.RPCRatePerSec, cfg.RPCRateBurst)
 		srv.SetPeersFunc(func() []glue.PeerEntry {
 			if n := eng.curNode(); n != nil {
 				return n.Peers()
@@ -905,4 +939,14 @@ func buildRaptorcast(cfg EngineConfig, self types.NodeId, key *crypto.SecpKeyPai
 			RngSeed:                         uint64(self.PubKey[0])*2654435761 + 1,
 		},
 	})
+}
+
+// newBlockPolicy — the policy matching the execution mode: upstream's
+// fixed seq-delay lookup needs speculative results; final-only execution
+// needs the variable-lag FinalOnlyPolicy.
+func newBlockPolicy(speculative bool, delay types.SeqNum, baseFee, trend, moment uint64) blocktree.BlockPolicy {
+	if speculative {
+		return blocktree.NewEvmBlockPolicy(delay, baseFee, trend, moment)
+	}
+	return NewFinalOnlyPolicy(delay, baseFee, trend, moment)
 }

@@ -9,7 +9,6 @@ import (
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	evmtypes "github.com/cosmos/evm/x/vm/types"
 
-	"github.com/abhijitkrm/monadbft-go/blocktree"
 	"github.com/abhijitkrm/monadbft-go/chaincfg"
 	"github.com/abhijitkrm/monadbft-go/consensusstate"
 	"github.com/abhijitkrm/monadbft-go/glue"
@@ -22,7 +21,8 @@ import (
 // Config — bridge testnet parameters.
 type Config struct {
 	ChainConfig        chaincfg.Config
-	ExecutionDelay     types.SeqNum // delayed-exec window (≥2 for sync exec)
+	ExecutionDelay     types.SeqNum // delayed-exec window (≥3 final, ≥2 speculative)
+	Speculative        bool         // legacy SpecApp execution (default: final-only)
 	Delta              time.Duration
 	StatesyncThreshold types.SeqNum
 	EpochLength        types.SeqNum // valset boundary length
@@ -85,8 +85,14 @@ func NewNodes(apps []*App, vals []Validator, cfg Config) (swarm.SwarmBuilder, er
 // boot point (ForkpointGenesis() for a fresh network, or a live peer's
 // forkpoint for a rejoining node).
 func NewNodeBuilder(i int, app *App, v Validator, allPeers []types.NodeId, lockedEpochValidators []glue.ValidatorSetDataWithEpoch, cfg Config) (*swarm.NodeBuilder, error) {
-	spec := NewSpecApp(app)
+	var spec *SpecApp // nil → final-only execution
+	if cfg.Speculative {
+		spec = NewSpecApp(app)
+	}
 	ledger := NewLedger(app, spec)
+	ledger.SetSyncCommit(true) // swarm = discrete-event sim: no background app work
+	pool := NewTxPool(app)
+	pool.SetLedger(ledger)
 	valset, err := NewValSet(app, cfg.EpochLength)
 	if err != nil {
 		return nil, err
@@ -106,7 +112,7 @@ func NewNodeBuilder(i int, app *App, v Validator, allPeers []types.NodeId, locke
 		StateBuilder: &monadstate.Builder{
 			LeaderElection: validator.WeightedRoundRobin{},
 			BlockValidator: NewEvmBlockValidator(decoder, ethChainID),
-			BlockPolicy: blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
+			BlockPolicy: newBlockPolicy(cfg.Speculative, cfg.ExecutionDelay,
 				swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment),
 			StateRead: NewStateRead(app, spec),
 
@@ -133,7 +139,7 @@ func NewNodeBuilder(i int, app *App, v Validator, allPeers []types.NodeId, locke
 		},
 		RouterScheduler:   swarm.NewBytesRouterScheduler(allPeers, Evm),
 		ValSetUpdater:     valset,
-		TxPoolExecutor:    NewTxPool(app),
+		TxPoolExecutor:    pool,
 		Ledger:            ledger,
 		StateSyncExecutor: NewStateSync(app, ledger, spec),
 		OutboundPipeline:  swarm.TransformerPipeline{swarm.NewLatencyTransformer(cfg.Delta)},

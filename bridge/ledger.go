@@ -84,10 +84,15 @@ type Ledger struct {
 	// FIFO preserves seq order; l.committed is marked at enqueue so readers
 	// see the consensus-finalized chain even while the app commit is in
 	// flight. close() drains the buffer before the worker exits.
-	commitQ    chan *cstypes.ConsensusFullBlock
-	commitWg   sync.WaitGroup
-	commitOnce sync.Once
-	commitDone chan struct{}
+	commitQ chan *cstypes.ConsensusFullBlock
+	// syncCommit — apply finalized blocks inline at the end of Exec instead
+	// of on the worker (deterministic swarm simulation; no background app
+	// work outliving a step). syncPending is the batch for the current Exec.
+	syncCommit  bool
+	syncPending []*cstypes.ConsensusFullBlock
+	commitWg    sync.WaitGroup
+	commitOnce  sync.Once
+	commitDone  chan struct{}
 }
 
 // certifierEntry — the lowest-round observed QC certifying a block id, with
@@ -134,6 +139,15 @@ func (l *Ledger) onSpecDone(blockID types.BlockId) {
 func (l *Ledger) SetRetain(keep, pruneKeep types.SeqNum) {
 	l.retain = keep
 	l.pruneKeep = pruneKeep
+}
+
+// SetSyncCommit — execute finalized blocks synchronously within Exec (after
+// l.mu is released). For the discrete-event swarm only: production keeps
+// app latency off the node loop via the commit worker.
+func (l *Ledger) SetSyncCommit(on bool) {
+	l.mu.Lock()
+	l.syncCommit = on
+	l.mu.Unlock()
 }
 
 // Close — drain the canonical-commit queue and stop the worker. Callers must
@@ -294,6 +308,24 @@ func (l *Ledger) reconcileStoreTip(cp *cstypes.Checkpoint) {
 	}
 }
 
+// committedAbove — finalized blocks with seq > h, ascending (in-memory
+// window; the txpool's in-flight exclusion set reads the few above the
+// app's executed height).
+func (l *Ledger) committedAbove(h int64) []*cstypes.ConsensusFullBlock {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if h < 0 {
+		h = 0
+	}
+	var out []*cstypes.ConsensusFullBlock
+	for seq := types.SeqNum(h + 1); seq <= l.maxCommitted; seq++ {
+		if b := l.committed[seq]; b != nil {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
 // SetCommitHook registers the per-commit callback (engine event bus).
 func (l *Ledger) SetCommitHook(fn func(seq int64)) {
 	l.mu.Lock()
@@ -370,7 +402,12 @@ func (l *Ledger) getBlock(id types.BlockId) *cstypes.ConsensusFullBlock {
 func (l *Ledger) Exec(cmds []glue.LedgerCommand) {
 	l.mu.Lock()
 	l.execLocked(cmds)
+	pending := l.syncPending
+	l.syncPending = nil
 	l.mu.Unlock()
+	for _, b := range pending {
+		l.execCanonical(b)
+	}
 	l.runCommitHooks()
 }
 
@@ -434,6 +471,10 @@ func (l *Ledger) commitFinalized(block *cstypes.ConsensusFullBlock) {
 			continue
 		}
 		l.markCommitted(b)
+		if l.syncCommit {
+			l.syncPending = append(l.syncPending, b)
+			continue
+		}
 		l.commitOnce.Do(func() {
 			l.commitWg.Add(1)
 			go l.commitLoop()

@@ -52,6 +52,7 @@ type RPCServer struct {
 	consFn  func() map[string]any   // last-commit consensus snapshot (dump_consensus_state)
 
 	limiter *ipLimiter
+	noLimit bool // rate limiting disabled (trusted/loopback benchmarking)
 
 	http *http.Server
 	ln   net.Listener
@@ -845,7 +846,24 @@ func (l *ipLimiter) allow(ip string) bool {
 	return lim.Allow()
 }
 
+// SetRateLimit — per-IP request limit: perSec 0 keeps the default
+// (rpcRatePerSec/rpcRateBurst), < 0 disables limiting. Call before Start.
+func (s *RPCServer) SetRateLimit(perSec float64, burst int) {
+	switch {
+	case perSec < 0:
+		s.noLimit = true
+	case perSec > 0:
+		if burst <= 0 {
+			burst = int(2 * perSec)
+		}
+		s.limiter = newIPLimiter(rate.Limit(perSec), burst)
+	}
+}
+
 func (s *RPCServer) allow(r *http.Request) bool {
+	if s.noLimit {
+		return true
+	}
 	if s.limiter == nil {
 		s.limiter = newIPLimiter(rpcRatePerSec, rpcRateBurst)
 	}

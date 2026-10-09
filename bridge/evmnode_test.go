@@ -120,8 +120,15 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 		if err != nil {
 			t.Fatalf("NewValSet node %d: %v", i, err)
 		}
-		spec := bridge.NewAsyncSpecApp(app)
-		t.Cleanup(spec.Close)
+		var spec *bridge.SpecApp // nil → final-only execution
+		var policy blocktree.BlockPolicy = bridge.NewFinalOnlyPolicy(cfg.ExecutionDelay,
+			swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment)
+		if cfg.Speculative {
+			spec = bridge.NewAsyncSpecApp(app)
+			t.Cleanup(spec.Close)
+			policy = blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
+				swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment)
+		}
 		ledger := bridge.NewLedger(app, spec)
 		var transport node.Transport
 		switch transportKind {
@@ -153,16 +160,15 @@ func testEvmOverNodeRuntime(t *testing.T, transportKind string) {
 				StartExecutionThreshold:    types.SeqNum(cfg.StatesyncThreshold.Uint64() / 2),
 				TimestampLatencyEstimateNs: types.U128FromUint64(10_000_000),
 			},
-			BlockValidator: blocktree.MockValidator{},
-			BlockPolicy: blocktree.NewEvmBlockPolicy(cfg.ExecutionDelay,
-				swarm.MinBaseFee, swarm.GenesisBaseFeeTrend, swarm.GenesisBaseFeeMoment),
+			BlockValidator:         blocktree.MockValidator{},
+			BlockPolicy:            policy,
 			StateRead:              bridge.NewStateRead(app, spec),
 			StatesyncExpandToGroup: true,
 			ServeStatesync:         true,
 			GenesisValidators:      genesisVals,
 			Executors: node.Executors{
 				Ledger:    ledger,
-				TxPool:    newPoolBridge(app, &pools[i]),
+				TxPool:    newPoolBridge(app, ledger, &pools[i]),
 				ValSet:    valset,
 				StateSync: bridge.NewStateSync(app, ledger, spec),
 				Transport: transport,
@@ -355,8 +361,9 @@ func tcpAddrFrom(t *testing.T, a string) uint16 {
 
 // newPoolBridge — retain a handle to the pool so the test can assert on
 // forwarding counters.
-func newPoolBridge(app *bridge.App, out **bridge.TxPool) *bridge.TxPool {
+func newPoolBridge(app *bridge.App, ledger *bridge.Ledger, out **bridge.TxPool) *bridge.TxPool {
 	p := bridge.NewTxPool(app)
+	p.SetLedger(ledger)
 	*out = p
 	return p
 }

@@ -65,7 +65,20 @@ func buildTestnetDelay(t *testing.T, n int, delay types.SeqNum) ([]*bridge.App, 
 	if err != nil {
 		t.Fatalf("NewNodes: %v", err)
 	}
-	return apps, raws, builders.Build()
+	nodes := builders.Build()
+	t.Cleanup(func() { closeLedgers(nodes) })
+	return apps, raws, nodes
+}
+
+// closeLedgers — drain and stop every node's canonical-commit worker. The
+// test EVM chain config is a process global: a later ResetTestConfig must
+// not race a worker still executing FinalizeBlock in the background.
+func closeLedgers(nodes *swarm.Nodes) {
+	for _, id := range nodes.SortedKeys() {
+		if l, ok := nodes.Node(id).Executor.Ledger().(*bridge.Ledger); ok {
+			l.Close()
+		}
+	}
 }
 
 // runUntil — drive the swarm until every node has ≥ target finalized blocks.
@@ -220,6 +233,11 @@ func TestBridgeTxInclusion(t *testing.T) {
 // spec-produced results (reused by the ledger) and canonical fallbacks —
 // all must equal independent re-execution.
 func TestBridgeDeferredExecParity(t *testing.T) {
+	t.Run("final", func(t *testing.T) { testDeferredExecParity(t, false, 3) })
+	t.Run("speculative", func(t *testing.T) { testDeferredExecParity(t, true, 2) })
+}
+
+func testDeferredExecParity(t *testing.T, speculative bool, delay types.SeqNum) {
 	const minHeight = 14
 
 	vals := bridge.MakeValidators(4)
@@ -238,12 +256,14 @@ func TestBridgeDeferredExecParity(t *testing.T) {
 		apps[i], raws[i] = app, raw
 	}
 	cfg := bridge.DefaultConfig()
-	cfg.ExecutionDelay = 2
+	cfg.ExecutionDelay = delay
+	cfg.Speculative = speculative
 	builders, err := bridge.NewNodes(apps, vals, cfg)
 	if err != nil {
 		t.Fatalf("NewNodes: %v", err)
 	}
 	nodes := builders.Build()
+	t.Cleanup(func() { closeLedgers(nodes) })
 	ids := nodes.SortedKeys()
 
 	runUntil(t, nodes, ids, 4)
@@ -254,6 +274,8 @@ func TestBridgeDeferredExecParity(t *testing.T) {
 	assertSameChain(t, apps, minHeight)
 
 	// canonical replay: fresh app, execute the committed blocks in order.
+	// Quiesce the swarm's commit workers first (shared EVM config global).
+	closeLedgers(nodes)
 	evmtypes.NewEVMConfigurator().ResetTestConfig()
 	replay, _, err := bridge.NewEvmdApp(bridge.EvmdConfig{
 		ChainID:    "monadbft-bridge-test",

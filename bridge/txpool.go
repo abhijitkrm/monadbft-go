@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -9,6 +10,7 @@ import (
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 
+	"github.com/abhijitkrm/monadbft-go/cstypes"
 	"github.com/abhijitkrm/monadbft-go/glue"
 	"github.com/abhijitkrm/monadbft-go/swarm"
 )
@@ -23,6 +25,9 @@ import (
 //     FinalizeBlock)
 type TxPool struct {
 	app *App
+	// ledger — source of finalized-but-not-yet-executed blocks for the
+	// in-flight exclusion set (nil → extending blocks only).
+	ledger *Ledger
 	// mu guards events+lastErrs: SendTransaction is called from outside the
 	// node loop (RPC submission); Ready/Next/Exec run on the loop.
 	mu       sync.Mutex
@@ -56,6 +61,48 @@ func (t *TxPool) SetFeeParams(baseFee, trend, moment uint64) {
 	t.baseFee, t.baseFeeTrend, t.baseFeeMoment = baseFee, trend, moment
 }
 
+// SetLedger — wire the ledger for the in-flight exclusion set.
+func (t *TxPool) SetLedger(l *Ledger) { t.ledger = l }
+
+// inflightMargin — executed heights still included in the exclusion set,
+// covering the window between the app recording a commit and the mempool
+// finishing its recheck at that height.
+const inflightMargin = 2
+
+// inflightTxs — txs already carried by the chain this proposal extends but
+// not yet reflected in the app state the mempool validates against: the
+// unfinalized extending blocks plus finalized blocks the app hasn't
+// executed. With final-only execution the mempool's view trails the
+// proposal frontier by several blocks, so without this every upcoming
+// leader (all of which receive forwarded txs) re-proposes the same txs and
+// the repeats fail on nonce at execution.
+func (t *TxPool) inflightTxs(extending []*cstypes.ConsensusFullBlock) (map[[32]byte]struct{}, int) {
+	set := map[[32]byte]struct{}{}
+	size := 0
+	add := func(b *cstypes.ConsensusFullBlock) {
+		body, ok := b.Body.Inner.ExecutionBody.(*EvmBody)
+		if !ok {
+			return
+		}
+		for _, tx := range body.Txs {
+			h := sha256.Sum256(tx)
+			if _, dup := set[h]; !dup {
+				set[h] = struct{}{}
+				size += len(tx)
+			}
+		}
+	}
+	if t.ledger != nil {
+		for _, b := range t.ledger.committedAbove(t.app.committedHeight() - inflightMargin) {
+			add(b)
+		}
+	}
+	for _, b := range extending {
+		add(b)
+	}
+	return set, size
+}
+
 // SetWakeFunc — node.WakeProducer: SendTransaction enqueues ForwardTxs
 // events outside the exec loop.
 func (t *TxPool) SetWakeFunc(f func()) { t.wake = f }
@@ -79,6 +126,7 @@ func (t *TxPool) Exec(cmds []glue.TxPoolCommand) {
 // the selected txs as the block body.
 func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 	ctx := context.Background()
+	inflight, inflightBytes := t.inflightTxs(c.ExtendingBlocks)
 
 	// opMu: ReapTxs+PrepareProposal must not interleave with a spec commit.
 	t.app.opMu.Lock()
@@ -103,8 +151,12 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 	// clears). ReapNewValidTxs returns only unreaped txs, so in-flight
 	// proposals stay disjoint.
 	res, err := t.app.app.PrepareProposal(ctx, &abcitypes.RequestPrepareProposal{
-		Txs:                reap.Txs,
-		MaxTxBytes:         int64(c.ProposalByteLimit),
+		Txs: reap.Txs,
+		// Selection runs over the mempool's pending set at the executed
+		// height, which still contains the in-flight txs (lowest nonces,
+		// selected first): widen the budget by their size so filtering
+		// them out below doesn't starve the block.
+		MaxTxBytes:         int64(c.ProposalByteLimit) + int64(inflightBytes),
 		Height:             t.app.StoreTip() + 1,
 		Time:               time.Unix(0, int64(c.TimestampNs.Uint64())),
 		ProposerAddress:    t.app.ConsAddr(c.NodeId),
@@ -115,9 +167,7 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 	if err != nil {
 		panic(fmt.Sprintf("bridge: PrepareProposal r=%d seq=%d: %v", c.Round, c.SeqNum, err))
 	}
-	if uint64(len(res.Txs)) > c.TxLimit {
-		res.Txs = res.Txs[:c.TxLimit]
-	}
+	res.Txs = trimProposal(res.Txs, inflight, c.TxLimit, c.ProposalByteLimit)
 
 	t.mu.Lock()
 	t.events = append(t.events, glue.EvMempoolProposal{
@@ -142,6 +192,24 @@ func (t *TxPool) createProposal(c glue.TxPoolCreateProposal) {
 		FreshProposalCertificate: c.FreshProposalCertificate,
 	})
 	t.mu.Unlock()
+}
+
+// trimProposal — drop in-flight txs, then cap to the proposal tx/byte
+// limits (selection order preserved).
+func trimProposal(txs [][]byte, inflight map[[32]byte]struct{}, txLimit, byteLimit uint64) [][]byte {
+	out := txs[:0:0]
+	var bytes uint64
+	for _, tx := range txs {
+		if _, dup := inflight[sha256.Sum256(tx)]; dup {
+			continue
+		}
+		if uint64(len(out)) >= txLimit || bytes+uint64(len(tx)) > byteLimit {
+			break
+		}
+		out = append(out, tx)
+		bytes += uint64(len(tx))
+	}
+	return out
 }
 
 // insertTxs — CheckTx + InsertTx; returns the txs that landed in the pool.

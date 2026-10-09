@@ -64,19 +64,17 @@ func (s *StateRead) RawReadEarliestFinalizedBlock() *types.SeqNum {
 	return min
 }
 
-// RawReadLatestFinalizedBlock — highest committed seq.
+// RawReadLatestFinalizedBlock — highest committed seq (O(1): a.height is
+// written with the result entry). The final-only proposer reads it on
+// every proposal.
 func (s *StateRead) RawReadLatestFinalizedBlock() *types.SeqNum {
 	s.app.mu.Lock()
 	defer s.app.mu.Unlock()
-	var max *types.SeqNum
-	for seq := range s.app.results {
-		sn := types.SeqNum(seq)
-		if max == nil || sn > *max {
-			cp := sn
-			max = &cp
-		}
+	if len(s.app.results) == 0 {
+		return nil
 	}
-	return max
+	h := types.SeqNum(s.app.height)
+	return &h
 }
 
 // ReadValsetAtBlock — the validator set for `requestedEpoch`. The bridge's
