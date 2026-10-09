@@ -17,6 +17,8 @@ type BlockBuffer struct {
 	resyncThreshold types.SeqNum
 	// TFM reserve-balance checking needs N-2*state_root_delay blocks for N
 	minNumBlocks types.SeqNum
+	// executionDelay — fallback target offset when the root embeds no result.
+	executionDelay types.SeqNum
 
 	root types.BlockId
 	// blocks <= root
@@ -40,6 +42,7 @@ func NewBlockBuffer(executionDelay types.SeqNum, root types.BlockId, resyncThres
 		maxBufferedProposals: int(resyncThreshold),
 		resyncThreshold:      resyncThreshold,
 		minNumBlocks:         types.SeqNum(uint64(executionDelay) * 2),
+		executionDelay:       executionDelay,
 		root:                 root,
 		fullBlocks:           make(map[types.BlockId]*cstypes.ConsensusFullBlock),
 		payloadCache:         make(map[cstypes.ConsensusBlockBodyId]*cstypes.ConsensusBlockBody),
@@ -90,6 +93,45 @@ func (b *BlockBuffer) RootInfo() *blocktree.RootInfo {
 		BlockId:     root.GetId(),
 		TimestampNs: root.GetTimestamp(),
 	}
+}
+
+// ExecutionTarget — the seq whose execution result the root embeds: the
+// DB/statesync target. Upstream's fixed-delay policy makes this always
+// root-delay; reading it from the root header instead keeps variable-lag
+// block policies (results of the latest *finalized* block ≤ seq-delay)
+// correct, with identical behavior under a fixed delay. Falls back to
+// root-delay (clamped) when the root embeds no result (seq < delay).
+func (b *BlockBuffer) ExecutionTarget() (types.SeqNum, bool) {
+	ri := b.RootInfo()
+	if ri == nil {
+		return 0, false
+	}
+	if root, ok := b.fullBlocks[b.root]; ok {
+		if res := root.GetExecutionResults(); len(res) == 1 {
+			return res[0].SeqNum(), true
+		}
+	}
+	return ri.SeqNum.SaturatingSub(b.executionDelay), true
+}
+
+// RequiredChainLen — root-parent blocks to hold: 2*delay (upstream), widened
+// to reach the root's embedded result seq when its lag exceeds that.
+func (b *BlockBuffer) RequiredChainLen() types.SeqNum {
+	root, ok := b.fullBlocks[b.root]
+	if !ok {
+		return b.minNumBlocks
+	}
+	return b.chainLenFor(root.GetSeqNum(), root.GetExecutionResults())
+}
+
+func (b *BlockBuffer) chainLenFor(rootSeq types.SeqNum, res []exec.FinalizedHeader) types.SeqNum {
+	n := b.minNumBlocks
+	if len(res) == 1 && res[0].SeqNum() < rootSeq {
+		if need := rootSeq - res[0].SeqNum() + 1; need > n {
+			n = need
+		}
+	}
+	return n
 }
 
 // RootDelayedExecutionResult — Rust root_delayed_execution_result.
@@ -153,8 +195,9 @@ func (b *BlockBuffer) HandleBlocksync(block cstypes.ConsensusFullBlock) {
 
 // ReRoot — Rust BlockBuffer::re_root: advance the root and prune.
 func (b *BlockBuffer) ReRoot(newRoot cstypes.ConsensusBlockHeader) {
+	keep := b.chainLenFor(newRoot.SeqNum, newRoot.DelayedExecutionResults)
 	for id, blk := range b.fullBlocks {
-		if blk.GetSeqNum()+b.minNumBlocks < newRoot.SeqNum {
+		if blk.GetSeqNum()+keep < newRoot.SeqNum {
 			delete(b.fullBlocks, id)
 		}
 	}
@@ -207,16 +250,17 @@ func (b *BlockBuffer) NeedsBlocksync() *cstypes.BlockRange {
 	if len(chain) == 0 {
 		return &cstypes.BlockRange{LastBlockId: b.root, NumBlocks: b.minNumBlocks}
 	}
+	required := b.RequiredChainLen()
 	last := chain[len(chain)-1]
 	// Chain terminates at genesis — no earlier full block exists to fetch.
 	if last.GetSeqNum() <= types.SeqNum(1) {
 		return nil
 	}
-	if uint64(len(chain)) < uint64(b.minNumBlocks) {
+	if uint64(len(chain)) < uint64(required) {
 		// Clamp so the range can't dip below seq 1 — genesis (seq 0) is a
 		// sentinel id with no stored block; verifyBlockHeaders accepts the
 		// resulting genesis-terminated shortfall.
-		want := b.minNumBlocks - types.SeqNum(len(chain))
+		want := required - types.SeqNum(len(chain))
 		if avail := last.GetSeqNum() - 1; want > avail {
 			want = avail
 		}

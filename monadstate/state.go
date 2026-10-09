@@ -454,15 +454,8 @@ func (m *MonadState) updateStateSync(ev glue.StateSyncEvent) []glue.Command {
 		if m.consensus.dbStatus != DbSyncWaiting && m.consensus.dbStatus != DbSyncStarted {
 			panic("monadstate: unexpected db_status on DoneSync")
 		}
-		delay := m.consensusConfig.ExecutionDelay
 		var maybeTarget *types.SeqNum
-		if rs, ok := m.consensus.blockBuffer.RootSeqNum(); ok {
-			t := rs
-			if t >= delay {
-				t -= delay
-			} else {
-				t = 0
-			}
+		if t, ok := m.consensus.blockBuffer.ExecutionTarget(); ok {
 			maybeTarget = &t
 		}
 		if maybeTarget != nil && e.SeqNum >= *maybeTarget {
@@ -570,13 +563,9 @@ func (m *MonadState) maybeStartConsensus() []glue.Command {
 	}
 	rootSeqNum := rootInfo.SeqNum
 
-	delay := m.consensusConfig.ExecutionDelay
-	delaySeqNum := rootSeqNum
-	if delaySeqNum >= delay {
-		delaySeqNum -= delay
-	} else {
-		delaySeqNum = 0
-	}
+	// The DB target is the seq whose result the root embeds (root-delay
+	// under a fixed-delay policy).
+	delaySeqNum, _ := bb.ExecutionTarget()
 
 	if m.consensus.dbStatus == DbSyncWaiting {
 		m.consensus.dbStatus = DbSyncStarted
@@ -628,9 +617,10 @@ func (m *MonadState) maybeStartConsensus() []glue.Command {
 
 	var cmds []glue.Command
 
-	// the last 2*delay committed blocks (oldest-first), policy-validated.
+	// the last 2*delay committed blocks (oldest-first, widened to cover
+	// the root's embedded result seq), policy-validated.
 	var lastCommitted []*cstypes.ConsensusFullBlock
-	n := int(delay) * 2
+	n := int(bb.RequiredChainLen())
 	for i, blk := range rootParentChain {
 		if i >= n {
 			break
