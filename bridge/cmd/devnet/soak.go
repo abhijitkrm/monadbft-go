@@ -166,6 +166,27 @@ type soakReport struct {
 	SettleHeights []int64 `json:"settle_heights"`
 	FinalHeights  []int64 `json:"final_heights"`
 	ParityFails   int     `json:"apphash_parity_fails"`
+
+	// Post-run audit — every height 1..min(final) compared across all nodes
+	// (block id + app hash), which covers the heights a restarted node
+	// replayed. This is the release bar, not the live sample check.
+	AuditHeights    int64                      `json:"audit_heights"`
+	AuditMismatches []auditDiff                `json:"audit_mismatches"`
+	AuditUnserved   int64                      `json:"audit_unserved"` // heights some node couldn't serve
+	Panics          map[int]int                `json:"panics"`         // node → panic/fatal lines in evmd.log
+	PanicSamples    []string                   `json:"panic_samples,omitempty"`
+	Engine          string                     `json:"engine"`
+	Consensus       map[int]map[string]float64 `json:"consensus_counters,omitempty"`
+	Perf            *perfStats                 `json:"perf,omitempty"`
+	Pass            bool                       `json:"pass"`
+	FailReasons     []string                   `json:"fail_reasons,omitempty"`
+}
+
+// auditDiff — one height where nodes disagree.
+type auditDiff struct {
+	Height   int64    `json:"height"`
+	BlockIDs []string `json:"block_ids"`
+	AppHash  []string `json:"app_hashes"`
 }
 
 func cmdSoak(args []string) error {
@@ -178,6 +199,7 @@ func cmdSoak(args []string) error {
 	killAfter := fs.Duration("kill-after", 45*time.Second, "when to kill -kill node")
 	sampleEvery := fs.Duration("sample", 10*time.Second, "RSS/disk/height cadence")
 	reportPath := fs.String("report", "", "write JSON report (default <out>/soak-report.json)")
+	workers := fs.Int("workers", 8, "concurrent load-gen workers (senders are partitioned across them)")
 	fs.Parse(args)
 
 	bin, err := evmdBin(*evmd)
@@ -209,13 +231,17 @@ func cmdSoak(args []string) error {
 	}
 	txCfg := evmencoding.MakeConfig(evmtypes.DefaultEVMChainID).TxConfig
 
-	procs, err := startNodes(homes, bin, chainID)
+	for _, h := range homes {
+		_ = os.Remove(nodeLogPath(h)) // panic scan covers this run only
+	}
+	engine := devnetEngine(*out)
+	procs, err := startNodes(homes, bin, chainID, engine)
 	if err != nil {
 		return err
 	}
 	defer killAll(procs)
-	fmt.Printf("soak: %d nodes up, %d funded senders, rate=%d/s, duration=%s\n",
-		len(procs), len(keys), *rate, dur)
+	fmt.Printf("soak: %d %s nodes up, %d funded senders, rate=%d/s, duration=%s\n",
+		len(procs), engine, len(keys), *rate, dur)
 
 	if err := waitForTip(*out, 2, 90*time.Second); err != nil {
 		return err
@@ -226,10 +252,14 @@ func cmdSoak(args []string) error {
 
 	var submitted, rejected int64
 	var wg sync.WaitGroup
-	go runLoad(ctx, *out, keys, txCfg, len(homes), *rate, &submitted, &rejected, &wg)
+	subs := newSubmitLog()
+	seen := newHeightWatch()
+	go seen.run(ctx, 0)
+	loadStart := time.Now()
+	runLoad(ctx, keys, txCfg, len(homes), *rate, *workers, subs, &submitted, &rejected, &wg)
 
 	var samples []soakSample
-	rep := soakReport{StartedAt: time.Now().UTC(), TargetTPS: *rate, KillNode: *killNode, Nodes: len(homes)}
+	rep := soakReport{StartedAt: time.Now().UTC(), TargetTPS: *rate, KillNode: *killNode, Nodes: len(homes), Engine: engine}
 	start := time.Now()
 
 	var killed, restarted bool
@@ -263,7 +293,7 @@ func cmdSoak(args []string) error {
 			killed, killedAt = true, time.Now()
 		}
 		if killed && !restarted && time.Since(killedAt) >= 3*time.Second {
-			newp, err := startOne(homes[*killNode], *killNode, bin, chainID)
+			newp, err := startOne(homes[*killNode], *killNode, bin, chainID, engine)
 			if err != nil {
 				fmt.Printf("soak: restart node%d failed: %v\n", *killNode, err)
 				killedAt = time.Now() // back off before retrying
@@ -304,6 +334,41 @@ done:
 	rep.DurationS = time.Since(start).Seconds()
 	rep.Samples = samples
 
+	auditHeights(&rep, len(homes))
+	rep.Perf = computePerf(subs, seen, loadStart, *dur)
+	rep.Consensus = consensusCounters(len(homes))
+	scanPanics(&rep, homes)
+	rep.Pass = true
+	fail := func(f string, a ...any) {
+		rep.Pass = false
+		rep.FailReasons = append(rep.FailReasons, fmt.Sprintf(f, a...))
+	}
+	for n, c := range rep.Panics {
+		if c > 0 {
+			fail("node%d logged %d panic/fatal lines", n, c)
+		}
+	}
+	if len(rep.AuditMismatches) > 0 {
+		fail("%d heights disagree across nodes (first h=%d)", len(rep.AuditMismatches), rep.AuditMismatches[0].Height)
+	}
+	if rep.Perf != nil && rep.Perf.DuplicateTxs > 0 {
+		fail("%d duplicate tx inclusions (same tx in more than one block)", rep.Perf.DuplicateTxs)
+	}
+	if rep.ParityFails > 0 {
+		fail("%d live samples with same-height app-hash disagreement", rep.ParityFails)
+	}
+	if *killNode >= 0 && !rep.Recovered {
+		fail("node%d never recovered to tip", *killNode)
+	}
+	if len(rep.FinalHeights) > 0 && len(rep.SettleHeights) >= len(homes) {
+		first := rep.SettleHeights[:len(homes)]
+		for i, h := range rep.FinalHeights {
+			if h <= first[i] {
+				fail("node%d did not advance during settle (%d → %d)", i, first[i], h)
+			}
+		}
+	}
+
 	outPath := *reportPath
 	if outPath == "" {
 		outPath = filepath.Join(*out, "soak-report.json")
@@ -314,19 +379,137 @@ done:
 	}
 	fmt.Printf("soak: report at %s — submitted=%d rejected=%d recovered=%v (%.0fs)\n",
 		outPath, rep.Submitted, rep.Rejected, rep.Recovered, rep.RecoverySecs)
+	fmt.Printf("soak: audit %d heights, %d mismatches, %d unserved; panics=%v\n",
+		rep.AuditHeights, len(rep.AuditMismatches), rep.AuditUnserved, rep.Panics)
+	if !rep.Pass {
+		return fmt.Errorf("soak FAILED: %s", strings.Join(rep.FailReasons, "; "))
+	}
+	fmt.Println("soak: PASS")
 	return nil
 }
 
-// runLoad — round-robin senders submitting signed transfers at `rate`/s
-// spread across node RPC ports. A rejected tx retries its nonce next tick
-// so per-sender nonce order never gaps.
-func runLoad(ctx context.Context, out string, keys []soakKey, txCfg clienttx.TxConfig,
-	nNodes, rate int, submitted, rejected *int64, wg *sync.WaitGroup,
+// auditHeights — compare block id + app hash at every height 1..min(final)
+// across all nodes via /block?height=H.
+func auditHeights(rep *soakReport, n int) {
+	lo := int64(-1)
+	for _, h := range rep.FinalHeights {
+		if lo < 0 || h < lo {
+			lo = h
+		}
+	}
+	if lo <= 0 {
+		return
+	}
+	rep.AuditHeights = lo
+	for h := int64(1); h <= lo; h++ {
+		ids := make([]string, n)
+		hashes := make([]string, n)
+		served := true
+		for i := 0; i < n; i++ {
+			id, ah, ok := blockAt(i, h)
+			if !ok {
+				served = false
+			}
+			ids[i], hashes[i] = id, ah
+		}
+		if !served {
+			rep.AuditUnserved++
+			continue
+		}
+		if !allEqual(ids) || !allEqual(hashes) {
+			rep.AuditMismatches = append(rep.AuditMismatches, auditDiff{Height: h, BlockIDs: ids, AppHash: hashes})
+		}
+	}
+}
+
+func allEqual(xs []string) bool {
+	for _, x := range xs[1:] {
+		if x != xs[0] {
+			return false
+		}
+	}
+	return true
+}
+
+// blockAt — (block id, header app_hash) at height h from node i.
+func blockAt(i int, h int64) (string, string, bool) {
+	resp, err := getRetry(fmt.Sprintf("http://127.0.0.1:%d/block?height=%d", rpcBase+i, h))
+	if err != nil {
+		return "", "", false
+	}
+	defer resp.Body.Close()
+	var env struct {
+		Result struct {
+			BlockID struct {
+				Hash string `json:"hash"`
+			} `json:"block_id"`
+			Block struct {
+				Header struct {
+					AppHash string `json:"app_hash"`
+				} `json:"header"`
+			} `json:"block"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil || env.Result.BlockID.Hash == "" {
+		return "", "", false
+	}
+	return env.Result.BlockID.Hash, env.Result.Block.Header.AppHash, true
+}
+
+// scanPanics — count panic/fatal lines in each node's evmd.log.
+func scanPanics(rep *soakReport, homes []string) {
+	rep.Panics = map[int]int{}
+	for i, home := range homes {
+		raw, err := os.ReadFile(nodeLogPath(home))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.HasPrefix(line, "panic:") || strings.HasPrefix(line, "fatal error:") ||
+				strings.Contains(line, "goroutine ") && strings.Contains(line, "[running]") {
+				rep.Panics[i]++
+				if len(rep.PanicSamples) < 10 {
+					rep.PanicSamples = append(rep.PanicSamples, fmt.Sprintf("node%d: %s", i, line))
+				}
+			}
+		}
+	}
+}
+
+// runLoad — `workers` goroutines, each owning a disjoint sender subset
+// (keys i%workers==w) and submitting at rate/workers per second across node
+// RPC ports. A rejected tx retries its nonce on the worker's next tick so
+// per-sender nonce order never gaps. Returns immediately; wg tracks workers.
+func runLoad(ctx context.Context, keys []soakKey, txCfg clienttx.TxConfig,
+	nNodes, rate, workers int, subs *submitLog, submitted, rejected *int64, wg *sync.WaitGroup,
 ) {
-	wg.Add(1)
-	defer wg.Done()
 	if rate <= 0 || len(keys) == 0 {
 		return
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(keys) {
+		workers = len(keys)
+	}
+	for w := 0; w < workers; w++ {
+		var mine []int
+		for i := w; i < len(keys); i += workers {
+			mine = append(mine, i)
+		}
+		wg.Add(1)
+		go func(mine []int) {
+			defer wg.Done()
+			loadWorker(ctx, keys, mine, txCfg, nNodes, rate/workers, subs, submitted, rejected)
+		}(mine)
+	}
+}
+
+func loadWorker(ctx context.Context, keys []soakKey, mine []int, txCfg clienttx.TxConfig,
+	nNodes, rate int, subs *submitLog, submitted, rejected *int64,
+) {
+	if rate < 1 {
+		rate = 1
 	}
 	interval := time.Second / time.Duration(rate)
 	if interval < time.Millisecond {
@@ -343,7 +526,7 @@ func runLoad(ctx context.Context, out string, keys []soakKey, txCfg clienttx.TxC
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			ki := int(idx % uint64(len(keys)))
+			ki := mine[int(idx%uint64(len(mine)))]
 			idx++
 			k := keys[ki].priv()
 			msg := evmtypes.NewTx(&evmtypes.EvmTxArgs{
@@ -367,6 +550,7 @@ func runLoad(ctx context.Context, out string, keys []soakKey, txCfg clienttx.TxC
 			}
 			u := fmt.Sprintf("http://127.0.0.1:%d/broadcast_tx_async?tx=0x%s",
 				rpcBase+(ki%nNodes), hex.EncodeToString(bz))
+			sent := time.Now()
 			resp, err := client.Get(u)
 			if err != nil {
 				atomic.AddInt64(rejected, 1)
@@ -384,6 +568,7 @@ func runLoad(ctx context.Context, out string, keys []soakKey, txCfg clienttx.TxC
 			}
 			if err := json.Unmarshal(body, &env); err == nil && env.Error == nil && env.Result.Code == 0 {
 				atomic.AddInt64(submitted, 1)
+				subs.add(bz, sent)
 				nonces[ki]++
 			} else {
 				atomic.AddInt64(rejected, 1)
@@ -396,9 +581,7 @@ func runLoad(ctx context.Context, out string, keys []soakKey, txCfg clienttx.TxC
 func collectSample(out string, procs []*exec.Cmd) soakSample {
 	s := soakSample{At: time.Now().UTC(), AppHashParity: true}
 	homes, _ := filepath.Glob(filepath.Join(out, "node*", "evmd"))
-	hashes := map[string]int{}
-	live := 0
-	var lo, hi int64 = -1, -1
+	byHeight := map[int64]map[string]bool{}
 	for i, p := range procs {
 		s.RSSMB = append(s.RSSMB, procRSS(p)/1024)
 		if i < len(homes) {
@@ -407,21 +590,18 @@ func collectSample(out string, procs []*exec.Cmd) soakSample {
 		h, ah := nodeStatus(i)
 		s.Heights = append(s.Heights, h)
 		if ah != "" {
-			hashes[ah]++
-			live++
-			if lo < 0 || h < lo {
-				lo = h
+			if byHeight[h] == nil {
+				byHeight[h] = map[string]bool{}
 			}
-			if h > hi {
-				hi = h
-			}
+			byHeight[h][ah] = true
 		}
 	}
-	// Parity means live nodes agree on latest_app_hash — but only when
-	// they're at the same tip height; a lagging restart node legitimately
-	// reports an older hash, so skip the check when heights spread > 1.
-	if live > 1 && hi-lo <= 1 && len(hashes) > 1 {
-		s.AppHashParity = false
+	// Parity: nodes reporting the same height must report the same
+	// latest_app_hash (different heights legitimately differ).
+	for _, set := range byHeight {
+		if len(set) > 1 {
+			s.AppHashParity = false
+		}
 	}
 	return s
 }

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	cmted25519 "github.com/cometbft/cometbft/crypto/ed25519"
 
@@ -90,7 +92,15 @@ func cmdInitFiles(args []string) error {
 	advertise := fs.String("ip", "127.0.0.1", "advertise address written into peer records")
 	fund := fs.Int("fund", 0, "also write N funded soak accounts into genesis + soak-keys.json")
 	fundAmt := fs.String("fund-amount", "1000000000000000000000000", "balance per funded account (atest)")
+	engine := fs.String("engine", engineMonad, "consensus engine: monadbft|comet (comet = stock CometBFT baseline)")
+	commitTimeout := fs.Duration("comet-commit-timeout", 300*time.Millisecond,
+		"comet only: consensus.timeout_commit (the evmd scaffold default is 5s — a straw-man baseline)")
+	signedWindow := fs.Int("signed-blocks-window", 10000, "x/slashing signed_blocks_window")
+	minSigned := fs.String("min-signed-per-window", "0.050000000000000000", "x/slashing min_signed_per_window")
 	fs.Parse(args)
+	if *engine != engineMonad && *engine != engineComet {
+		return fmt.Errorf("bad -engine %q (monadbft|comet)", *engine)
+	}
 
 	bin, err := evmdBin(*evmd)
 	if err != nil {
@@ -116,6 +126,10 @@ func cmdInitFiles(args []string) error {
 		// scaffolded config.toml defaults db_backend=rocksdb, which this
 		// build doesn't compile — pin a backend that exists
 		"--config-changes", "db_backend=goleveldb",
+		// the EVM mempool requires comet's app-side mempool type (evmd
+		// refuses to start with the scaffold's default "flood")
+		"--config-changes", "mempool.type=app",
+		"--commit-timeout", commitTimeout.String(),
 	}
 	c := exec.Command(bin, initArgs...)
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
@@ -175,6 +189,7 @@ func cmdInitFiles(args []string) error {
 		cfg.AuthPort = authBase + i
 		cfg.MetricsAddr = fmt.Sprintf("127.0.0.1:%d", metricsBase+i)
 		cfg.RPCAddr = fmt.Sprintf("127.0.0.1:%d", rpcBase+i)
+		cfg.RPCRatePerSec = -1                          // loopback-bound devnet RPC: unlimited, like comet's
 		cfg.AdvertiseIP = ip.String()                   // self name-record addr (raptorcast)
 		cfg.ValidatorsFile = "../../../validators.json" // root/config/../../../ = <out>/
 		cfg.PeersFile = "../../../peers.json"
@@ -194,6 +209,30 @@ func cmdInitFiles(args []string) error {
 		}
 	}
 
+	if *engine == engineComet {
+		// Comet RPC on the same per-node port the monadbft shim uses, so
+		// soak/bench drive both engines identically.
+		for i := 0; i < *n; i++ {
+			cfgToml := filepath.Join(*out, fmt.Sprintf("node%d", i), "evmd", "config", "config.toml")
+			if err := setTOML(cfgToml, "rpc", "laddr", fmt.Sprintf(`"tcp://127.0.0.1:%d"`, rpcBase+i)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(*out, "engine"), []byte(*engine+"\n"), 0o644); err != nil {
+		return err
+	}
+	// Downtime slashing tuned for QC semantics (both engines, so baselines
+	// share genesis): a MonadBFT QC carries only the first 2f+1 votes, so
+	// honest validators are routinely absent from DecidedLastCommit. A long
+	// window + low floor still jails a validator that is actually offline.
+	for i := 0; i < *n; i++ {
+		g := filepath.Join(*out, fmt.Sprintf("node%d", i), "evmd", "config", "genesis.json")
+		if err := setSlashingParams(g, *signedWindow, *minSigned); err != nil {
+			return fmt.Errorf("node%d genesis: %w", i, err)
+		}
+	}
+
 	if *fund > 0 {
 		if err := fundSoakAccounts(*out, *fund, *fundAmt); err != nil {
 			return fmt.Errorf("fund soak accounts: %w", err)
@@ -201,7 +240,7 @@ func cmdInitFiles(args []string) error {
 		fmt.Printf("devnet: %d soak accounts funded (soak-keys.json)\n", *fund)
 	}
 
-	fmt.Printf("devnet: %d validators under %s\n", *n, *out)
+	fmt.Printf("devnet: %d validators under %s (engine=%s)\n", *n, *out, *engine)
 	fmt.Printf("devnet: start with  devnet start -o %s -evmd %s\n", *out, bin)
 	return nil
 }
@@ -225,7 +264,7 @@ func cmdStart(args []string) error {
 		return err
 	}
 
-	procs, err := startNodes(entries, bin, chainID)
+	procs, err := startNodes(entries, bin, chainID, devnetEngine(*out))
 	if err != nil {
 		return err
 	}
@@ -244,28 +283,77 @@ func cmdStart(args []string) error {
 }
 
 // startOne launches a single evmd node with the per-node port layout.
-func startOne(home string, i int, bin, chainID string) (*exec.Cmd, error) {
-	c := exec.Command(bin, "start",
+func startOne(home string, i int, bin, chainID, engine string) (*exec.Cmd, error) {
+	args := []string{"start",
 		"--home", home,
-		"--engine=monadbft",
 		"--chain-id", chainID,
 		"--json-rpc.address", fmt.Sprintf("127.0.0.1:%d", jsonRPCBase+i),
 		"--grpc.address", fmt.Sprintf("localhost:%d", grpcBase+i),
 		"--grpc-web.address", fmt.Sprintf("localhost:%d", grpcWebBase+i),
-	)
-	c.Stdout = prefixWriter(fmt.Sprintf("node%d ", i), os.Stdout)
-	c.Stderr = prefixWriter(fmt.Sprintf("node%d ", i), os.Stderr)
+	}
+	if engine != engineComet {
+		args = append(args, "--engine=monadbft")
+	}
+	c := exec.Command(bin, args...)
+	// Raw output is also appended to <home>/evmd.log (survives restarts;
+	// soak scans it for panics after the run).
+	logf, err := os.OpenFile(nodeLogPath(home), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("node%d log: %w", i, err)
+	}
+	c.Stdout = io.MultiWriter(logf, prefixWriter(fmt.Sprintf("node%d ", i), os.Stdout))
+	c.Stderr = io.MultiWriter(logf, prefixWriter(fmt.Sprintf("node%d ", i), os.Stderr))
 	if err := c.Start(); err != nil {
+		logf.Close()
 		return nil, fmt.Errorf("node%d: %w", i, err)
 	}
 	return c, nil
 }
 
+func nodeLogPath(home string) string { return filepath.Join(home, "evmd.log") }
+
+const (
+	engineMonad = "monadbft"
+	engineComet = "comet"
+)
+
+// devnetEngine — the engine init-files recorded (monadbft when absent).
+func devnetEngine(out string) string {
+	raw, err := os.ReadFile(filepath.Join(out, "engine"))
+	if err != nil {
+		return engineMonad
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// setTOML — set key = value inside [section] ("" = top-level table, before
+// the first header). Fails if the key isn't present there.
+func setTOML(path, section, key, value string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(raw), "\n")
+	cur := ""
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			cur = strings.Trim(t, "[]")
+			continue
+		}
+		if cur == section && strings.HasPrefix(t, key+" ") || cur == section && strings.HasPrefix(t, key+"=") {
+			lines[i] = key + " = " + value
+			return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
+		}
+	}
+	return fmt.Errorf("%s: key %q not found in [%s]", path, key, section)
+}
+
 // startNodes launches every home; shared by `start` and `soak`.
-func startNodes(homes []string, bin, chainID string) ([]*exec.Cmd, error) {
+func startNodes(homes []string, bin, chainID, engine string) ([]*exec.Cmd, error) {
 	procs := make([]*exec.Cmd, 0, len(homes))
 	for i, home := range homes {
-		c, err := startOne(home, i, bin, chainID)
+		c, err := startOne(home, i, bin, chainID, engine)
 		if err != nil {
 			for _, p := range procs {
 				_ = p.Process.Kill()
@@ -351,4 +439,29 @@ func (p *linePrefixWriter) Write(b []byte) (int, error) {
 		}
 	}
 	return len(b), nil
+}
+
+// setSlashingParams — rewrite x/slashing downtime params in a genesis file.
+func setSlashingParams(path string, window int, minSigned string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var g map[string]any
+	if err := json.Unmarshal(raw, &g); err != nil {
+		return err
+	}
+	app, _ := g["app_state"].(map[string]any)
+	sl, _ := app["slashing"].(map[string]any)
+	params, _ := sl["params"].(map[string]any)
+	if params == nil {
+		return errors.New("no app_state.slashing.params")
+	}
+	params["signed_blocks_window"] = fmt.Sprint(window)
+	params["min_signed_per_window"] = minSigned
+	out, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
 }
