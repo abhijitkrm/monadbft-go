@@ -112,6 +112,34 @@ the version-deletion race the SpecLock fix now serializes. If it
 recurs, the diagnostic is per-node `consensus_events_local_timeout`
 and `handle_proposal` deltas during the freeze.
 
+## 2026-10-09 — final-only execution, 8 validators, A/B vs CometBFT
+
+Execution moved to finalized blocks only (`FinalOnlyPolicy`, see
+porting-plan D4 revision). Live 8-validator devnet on real binaries, soak
+gate = zero panics + full 1..tip block-id/app-hash audit + zero duplicate
+inclusions + kill recovery.
+
+- **All 7 MonadBFT runs PASS** (200–1500 tx/s, incl. kill/restart, 8 s
+  recovery). `rx_execution_lagging` = 0 everywhere.
+- **Duplicate inclusion bug found and fixed.** Under final-only execution
+  the mempool validates ~4 blocks behind the proposal frontier, and every
+  upcoming leader receives forwarded txs → each re-proposed them; 40 348 tx
+  slots carried 20 963 distinct txs in the first 200 blocks, repeats failed
+  `invalid nonce`. Fix: proposals exclude txs carried by the extending chain
+  or by finalized-not-yet-executed blocks (`TxPool.inflightTxs`), with the
+  selection byte budget widened by their size. Gate: `perf.duplicate_txs`.
+- **CometBFT baseline app-hash divergence** (1 of 5 runs, 600 tx/s): node0's
+  `bank` store differed at h=46 → `CONSENSUS FAILURE`. `apphash-diff`
+  localized it; not reproduced in 2 reruns nor in-process
+  (`TestParallelExecDeterminism`, `…ConcurrentCheckTx`: BlockSTM with one hot
+  recipient, ± concurrent CheckTx). Open; MonadBFT path serializes
+  CheckTx with block execution (`App.opMu`), CometBFT's local client doesn't.
+- Saturation (1500 tx/s) is machine-bound on the 8-core laptop for both
+  engines; MonadBFT degrades into round timeouts (3–4 s blocks), CometBFT
+  into empty blocks. Needs the dedicated server.
+
+Numbers: `release-notes-v0.1.0-alpha.1.md`.
+
 ## Reproduce
 
 ```bash

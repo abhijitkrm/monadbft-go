@@ -120,6 +120,30 @@ WS-4b for the design; the consensus types already carry the plumbing
 The `execution_delay=0` sync mode remains as a config fallback and the
 default while deferred mode is being proven.
 
+**Revised 2026-10-09 → final-only execution with variable-lag results.**
+Upstream executes *proposed* blocks (TrieDB keys proposed results by
+`(seq, block_id)` beside finalized ones) because a fixed `seq−delay`
+result may be unfinalized after a run of timeouts; executing only
+finalized blocks under the fixed rule deadlocks. The SDK's store is a
+single linear IAVL history, so our speculative port (`SpecApp`) had to
+`Commit` unfinalized blocks and `RollbackToVersion` orphans — the source
+of the rechecker panic, version-deletion race and spec-index bugs.
+v0.1 instead adapts the *block policy* (bridge `FinalOnlyPolicy`): block N
+embeds the result of a finalized seq `s` with `r(parent) ≤ s ≤ N−delay`;
+validators check it against their own finalized execution (waiting, not
+rejecting, while it executes); honest proposers pick
+`min(N−delay, executed final tip)` — identical to upstream on the happy
+path. `Commit` means final again; no SDK fork is needed. Core change is
+limited to `monadstate` statesync reading the root's *embedded* result seq
+instead of `root−delay` (behavior-identical under a fixed delay).
+`execution_mode: speculative` keeps the old path for A/B only. Trade-off:
+execution slack is `delay−2` blocks (default delay raised to 5).
+
+v0.1 scope (same date): 8 validators, fixed genesis set, TCP; success =
+more stable and faster than *tuned* stock CometBFT evmd on the same
+hardware/load. 300-validator parity, epochs, `x/consensuskeys`, IBC
+deferred. See `docs/alpha-runbook.md`.
+
 ### D5 — Mempool architecture
 
 The app-side `ExtMempool` (geth txpool + cosmos rechecker + reaplist) stays the
